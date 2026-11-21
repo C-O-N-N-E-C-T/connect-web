@@ -1,0 +1,139 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { MemoryRouter } from 'react-router-dom';
+import { validateLoginForm, LoginPage } from './LoginPage';
+
+const mocks = vi.hoisted(() => ({
+  signInWithPassword: vi.fn(),
+  signOut: vi.fn(),
+  registerBrowserSession: vi.fn(),
+}));
+
+vi.mock('../lib/supabase', () => ({
+  supabase: {
+    auth: {
+      signInWithPassword: mocks.signInWithPassword,
+      signOut: mocks.signOut,
+    },
+  },
+}));
+
+vi.mock('../services/authSessionClient', () => ({
+  registerBrowserSession: mocks.registerBrowserSession,
+}));
+
+function tokenFor(claims: object): string {
+  const b64url = (s: string) => btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  return `${b64url('{"alg":"HS256"}')}.${b64url(JSON.stringify(claims))}.sig`;
+}
+
+function renderLogin() {
+  return render(
+    <MemoryRouter>
+      <LoginPage />
+    </MemoryRouter>,
+  );
+}
+
+async function submitCredentials(email: string, password: string) {
+  const user = userEvent.setup();
+  await user.type(screen.getByLabelText('E-posta'), email);
+  await user.type(screen.getByLabelText('Şifre'), password);
+  await user.click(screen.getByRole('button', { name: 'Giriş yap' }));
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  mocks.signOut.mockResolvedValue({ error: null });
+});
+
+describe('validateLoginForm', () => {
+  it('accepts a gmail address with a password', () => {
+    expect(validateLoginForm('cansugnnn@gmail.com', 'secret')).toBeNull();
+  });
+
+  it('rejects a malformed email', () => {
+    expect(validateLoginForm('not-an-email', 'secret')).toBe('Geçerli bir e-posta adresi girin.');
+  });
+
+  it('rejects an empty password', () => {
+    expect(validateLoginForm('a@b.co', '')).toBe('Şifre boş bırakılamaz.');
+  });
+});
+
+describe('LoginPage', () => {
+  it('shows the supplementary disclaimer (AC-29)', () => {
+    renderLogin();
+    expect(screen.getByRole('note')).toHaveTextContent('kurtarmayı garanti etmez');
+  });
+
+  it('shows the invalid-credentials banner for a 4xx Supabase error', async () => {
+    mocks.signInWithPassword.mockResolvedValue({
+      data: { session: null },
+      error: { status: 400, message: 'Invalid login credentials' },
+    });
+    renderLogin();
+    await submitCredentials('a@b.co', 'wrong');
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('E-posta veya şifre hatalı.');
+    expect(mocks.registerBrowserSession).not.toHaveBeenCalled();
+  });
+
+  it('shows a connection message, not a wrong-password message, when the network fails', async () => {
+    mocks.signInWithPassword.mockResolvedValue({
+      data: { session: null },
+      error: { status: 0, message: 'Failed to fetch' },
+    });
+    renderLogin();
+    await submitCredentials('a@b.co', 'pw');
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Bağlantı kurulamadı');
+    expect(alert).not.toHaveTextContent('şifre hatalı');
+  });
+
+  it('rejects a rescuer with a clear role message and signs them out', async () => {
+    mocks.signInWithPassword.mockResolvedValue({
+      data: { session: { access_token: tokenFor({ user_role: 'rescuer' }) } },
+      error: null,
+    });
+    renderLogin();
+    await submitCredentials('rescuer@gmail.com', 'pw');
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Saha kurtarıcı hesapları web panelinden giriş yapamaz.',
+    );
+    expect(mocks.signOut).toHaveBeenCalledOnce();
+    expect(mocks.registerBrowserSession).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['ACCOUNT_DISABLED', 'Hesabınız devre dışı bırakıldı. Yöneticinize başvurun.'],
+    ['DEVICE_REVOKED', 'Bu cihazın erişimi iptal edildi.'],
+    ['RATE_LIMITED', 'Çok fazla deneme yapıldı. Lütfen bir dakika sonra tekrar deneyin.'],
+  ])('shows the banner for %s from /auth/session', async (code, message) => {
+    mocks.signInWithPassword.mockResolvedValue({
+      data: { session: { access_token: tokenFor({ user_role: 'coordinator' }) } },
+      error: null,
+    });
+    mocks.registerBrowserSession.mockResolvedValue({ ok: false, code });
+    renderLogin();
+    await submitCredentials('coordinator@gmail.com', 'pw');
+
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(message));
+    expect(mocks.signOut).toHaveBeenCalledOnce();
+  });
+
+  it('links the email validation error to its input', async () => {
+    renderLogin();
+    const user = userEvent.setup();
+    await user.type(screen.getByLabelText('E-posta'), 'bad');
+    await user.click(screen.getByRole('button', { name: 'Giriş yap' }));
+
+    const input = screen.getByLabelText('E-posta');
+    expect(input).toHaveAttribute('aria-invalid', 'true');
+    expect(input).toHaveAttribute('aria-describedby', 'form-error');
+    expect(mocks.signInWithPassword).not.toHaveBeenCalled();
+  });
+});
