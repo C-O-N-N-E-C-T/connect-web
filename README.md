@@ -36,7 +36,7 @@ npm run dev              # http://localhost:5173
 | Web dashboard (this repo) | `http://localhost:5173` | Fixed port, required by backend CORS |
 | Backend API (`connect-backend`) | `http://localhost:3000` | Set by `PORT` in the backend `.env` |
 
-Start the backend first, or at least make sure it is running before you use features that call the API. In `mock` auth mode the login flow does not call the backend, but `real` mode does.
+Start the backend first. Login calls `POST /api/v1/auth/session` on the backend in the default `real` mode, so the backend must be running for sign-in to complete.
 
 ## Environment variables
 
@@ -68,8 +68,8 @@ Rules:
 
 Login uses Supabase directly (`signInWithPassword`). After a successful login the app also registers the browser session with the backend (`POST /api/v1/auth/session`, OSP-60).
 
-- `VITE_AUTH_SESSION_MODE=mock` (default in `.env.example`): skips the backend call and treats registration as successful. Use this until the backend endpoint exists.
-- `VITE_AUTH_SESSION_MODE=real`: calls the backend. Only switch once `POST /api/v1/auth/session` is implemented and its response contract is confirmed.
+- `VITE_AUTH_SESSION_MODE=real` (default in `.env.example`): calls the backend. The contract is documented in `connect-backend/docs/osp-60-auth-session.md`. Success returns 200 with `{ user_id, role, device_id }`. Errors use `{ error_code, message }`: `ACCOUNT_DISABLED` and `DEVICE_REVOKED` return 403, `RATE_LIMITED` returns 429.
+- `VITE_AUTH_SESSION_MODE=mock`: skips the backend call and treats registration as successful. Use only for offline UI work without the backend.
 
 Restart `npm run dev` after changing `.env`. Vite reads environment variables only at startup.
 
@@ -146,5 +146,5 @@ Tests cover the login flow and error mapping, role routing, JWT claim reading, t
 ## Current status
 
 - Login, role-based routing, and the rescuer rejection are implemented.
-- Backend session registration runs in mock mode until OSP-60 is complete.
+- Backend session registration uses the OSP-60 endpoint (`real` mode by default).
 - Panels are placeholders. Map, records, and admin features come in later tickets.
