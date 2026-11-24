@@ -15,6 +15,7 @@ describe('performLogout', () => {
     const order: string[] = [];
     await performLogout(
       {
+        sessionKey: 'sess-1',
         storage: window.localStorage,
         callLogoutEndpoint: vi.fn(async () => {
           order.push(`request(flag=${window.localStorage.getItem(LOGOUT_PENDING_KEY)})`);
@@ -25,14 +26,29 @@ describe('performLogout', () => {
       },
       LOGOUT_TIMEOUT_MS,
     );
-    expect(order).toEqual(['request(flag=1)', 'signOut(flag=1)']);
+    expect(order).toEqual(['request(flag=sess-1)', 'signOut(flag=sess-1)']);
     expect(window.localStorage.getItem(LOGOUT_PENDING_KEY)).toBeNull();
+  });
+
+  it('does not remove a flag that a newer sign-in or logout replaced meanwhile (R6)', async () => {
+    await performLogout(
+      {
+        sessionKey: 'sess-1',
+        storage: window.localStorage,
+        callLogoutEndpoint: async () => undefined,
+        signOut: async () => {
+          window.localStorage.setItem(LOGOUT_PENDING_KEY, 'sess-2');
+        },
+      },
+      LOGOUT_TIMEOUT_MS,
+    );
+    expect(window.localStorage.getItem(LOGOUT_PENDING_KEY)).toBe('sess-2');
   });
 
   it('continues when the request rejects and when signOut throws', async () => {
     const signOut = vi.fn().mockRejectedValue(new Error('boom'));
     await performLogout(
-      { storage: window.localStorage, callLogoutEndpoint: vi.fn().mockRejectedValue(new Error('x')), signOut },
+      { sessionKey: 'sess-1', storage: window.localStorage, callLogoutEndpoint: vi.fn().mockRejectedValue(new Error('x')), signOut },
       LOGOUT_TIMEOUT_MS,
     );
     expect(signOut).toHaveBeenCalledOnce();
@@ -48,7 +64,7 @@ describe('performLogout is bounded (R1)', () => {
     vi.useFakeTimers();
     let finished = false;
     const done = performLogout(
-      { storage: window.localStorage, callLogoutEndpoint: async () => undefined, signOut: vi.fn(signOutImpl) },
+      { sessionKey: 'sess-1', storage: window.localStorage, callLogoutEndpoint: async () => undefined, signOut: vi.fn(signOutImpl) },
       LOGOUT_TIMEOUT_MS,
     ).then(() => (finished = true));
     await vi.advanceTimersByTimeAsync(3_500);
@@ -81,6 +97,7 @@ describe('logout through the API client', () => {
     const run = () =>
       performLogout(
         {
+          sessionKey: 'sess-1',
           storage: window.localStorage,
           callLogoutEndpoint: (timeoutMs) =>
             client.request('/api/v1/auth/logout', { method: 'POST', timeoutMs, recovery: false }),
@@ -129,7 +146,7 @@ describe('logout through the API client', () => {
     const done = run();
     await vi.advanceTimersByTimeAsync(4_999);
     expect(signOut).not.toHaveBeenCalled();
-    expect(window.localStorage.getItem(LOGOUT_PENDING_KEY)).toBe('1');
+    expect(window.localStorage.getItem(LOGOUT_PENDING_KEY)).toBe('sess-1');
 
     await vi.advanceTimersByTimeAsync(1);
     await done;

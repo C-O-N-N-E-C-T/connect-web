@@ -1,7 +1,7 @@
 /**
  * Logout flow (OSP-70, design D1 + D2 option "B").
  *
- *  1. Write `localStorage['connect.logout_pending']` BEFORE any network call.
+ *  1. Write `localStorage['connect.logout_pending'] = <session_id>` BEFORE any network call.
  *  2. POST /api/v1/auth/logout with a timeout and API-client recovery disabled (no refresh, no
  *     re-bind, no retry). Any outcome (network error, 5xx, 401, 403, 429, timeout) -> continue.
  *  3. `signOut({ scope: 'local' })`, bounded by SIGN_OUT_TIMEOUT_MS (it may refresh the token and
@@ -34,7 +34,15 @@ export const SIGN_OUT_TIMEOUT_MS = 3_000;
 /** Outer guard in case an injected signOut ignores its own bound. */
 const SIGN_OUT_GUARD_MS = SIGN_OUT_TIMEOUT_MS + 500;
 
+/** Flag value when the session's identity is unknown: matches any session. */
+export const ANY_SESSION = '1';
+
 export interface LogoutDeps {
+  /**
+   * Identity (JWT session_id) of the session being logged out. Stored as the flag value, so the
+   * flag never applies to a NEW sign-in (review R6).
+   */
+  sessionKey: string | null;
   /** localStorage, or null when storage is blocked (the flag is then simply unavailable). */
   storage: Storage | null;
   /** POST /api/v1/auth/logout with recovery disabled. May reject; the result is ignored. */
@@ -43,13 +51,32 @@ export interface LogoutDeps {
   signOut(): Promise<void>;
 }
 
-export function isLogoutPending(storage: Storage | null = safeLocalStorage()): boolean {
-  return storageGet(storage, LOGOUT_PENDING_KEY) !== null;
+/** Identity of the session whose logout is pending (ANY_SESSION if unknown), or null. */
+export function pendingLogoutKey(storage: Storage | null = safeLocalStorage()): string | null {
+  return storageGet(storage, LOGOUT_PENDING_KEY);
+}
+
+/**
+ * Whether a logout is pending — for the given session when `sessionKey` is passed (a flag for
+ * another session does not count), for any session otherwise.
+ */
+export function isLogoutPending(
+  storage: Storage | null = safeLocalStorage(),
+  sessionKey?: string | null,
+): boolean {
+  const pending = pendingLogoutKey(storage);
+  if (pending === null) return false;
+  if (sessionKey === undefined || sessionKey === null || pending === ANY_SESSION) return true;
+  return pending === sessionKey;
+}
+
+export function clearLogoutPending(storage: Storage | null = safeLocalStorage()): void {
+  storageRemove(storage, LOGOUT_PENDING_KEY);
 }
 
 export async function performLogout(deps: LogoutDeps, timeoutMs: number): Promise<void> {
   // Storage unavailable: the logout itself must still go on.
-  storageSet(deps.storage, LOGOUT_PENDING_KEY, '1');
+  storageSet(deps.storage, LOGOUT_PENDING_KEY, deps.sessionKey ?? ANY_SESSION);
   try {
     await deps.callLogoutEndpoint(timeoutMs);
   } catch {
@@ -60,5 +87,8 @@ export async function performLogout(deps: LogoutDeps, timeoutMs: number): Promis
     deps.signOut().catch(() => undefined),
     SIGN_OUT_GUARD_MS,
   );
-  storageRemove(deps.storage, LOGOUT_PENDING_KEY);
+  // Only remove OUR flag: a new sign-in may already have cleared it (and a later logout set its own).
+  if (pendingLogoutKey(deps.storage) === (deps.sessionKey ?? ANY_SESSION)) {
+    storageRemove(deps.storage, LOGOUT_PENDING_KEY);
+  }
 }

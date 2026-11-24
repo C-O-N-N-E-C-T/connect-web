@@ -4,7 +4,7 @@
  */
 import type { AuthChangeEvent, Session } from '@supabase/supabase-js';
 import { SUPABASE_AUTH_STORAGE_KEY, supabase } from '../lib/supabase';
-import { decodeJwtClaims } from '../lib/jwt';
+import { readSessionKey } from '../lib/jwt';
 import { withDeadline } from '../lib/deadline';
 import {
   safeLocalStorage,
@@ -25,15 +25,13 @@ type AuthListener = (event: AuthChangeEvent, session: Session | null) => void;
 const localSignOutListeners = new Set<AuthListener>();
 
 /** Identity (session_id, else sub) of the session persisted by supabase-js, or null. */
-function storedSessionKey(storage: Storage | null): string | null {
+export function storedSessionKey(storage: Storage | null): string | null {
   const raw = storageGet(storage, SUPABASE_AUTH_STORAGE_KEY);
   if (!raw) return null;
   try {
     const token = (JSON.parse(raw) as { access_token?: unknown }).access_token;
     if (typeof token !== 'string') return raw;
-    const claims = decodeJwtClaims(token);
-    const key = claims.session_id ?? claims.sub;
-    return typeof key === 'string' ? key : raw;
+    return readSessionKey(token) ?? raw;
   } catch {
     return raw;
   }
@@ -103,7 +101,7 @@ export const apiClient = createApiClient({
     ),
   forceSignOut,
   isSessionEnded,
-  isLogoutPending: () => isLogoutPending(),
+  isLogoutPending: (sessionKey) => isLogoutPending(safeLocalStorage(), sessionKey),
 });
 
 /** GET /api/v1/auth/me response (contract in design D3 / connect-backend docs). */
@@ -115,6 +113,7 @@ export interface AuthMeResponse {
 
 export const defaultAuthDeps: AuthProviderDeps = {
   markSessionEnded,
+  storedSessionKey: () => storedSessionKey(safeLocalStorage()),
   getSession: async () => {
     const { data } = await supabase.auth.getSession();
     return data.session;

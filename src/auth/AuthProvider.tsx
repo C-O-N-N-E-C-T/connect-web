@@ -15,8 +15,11 @@ import { isWebRole, type AppRole } from '../lib/roles';
 import type { ApiResult } from '../services/apiClient';
 import type { ForceSignOut } from './forcedSignOut';
 import {
+  ANY_SESSION,
+  clearLogoutPending,
   isLogoutPending,
   LOGOUT_TIMEOUT_MS,
+  pendingLogoutKey,
   performLogout,
   STARTUP_LOGOUT_TIMEOUT_MS,
 } from './logout';
@@ -56,6 +59,8 @@ export interface AuthProviderDeps {
   forceSignOut: ForceSignOut;
   /** Records that this tab ended a session on purpose (see endedSessions.ts). */
   markSessionEnded(sessionKey: string | null): void;
+  /** Identity of the session persisted by supabase-js, read without any network call. */
+  storedSessionKey(): string | null;
   setLoginNavigator(navigateToLogin: () => void): () => void;
   /** localStorage (holds the logout-pending flag), or null when storage is blocked. */
   storage(): Storage | null;
@@ -188,7 +193,7 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
       // R2: apply the answer only to the session that asked, and only for the same user. A stale
       // answer (user A's, arriving while user B is signed in) must not sign B out.
       const session = sessionRef.current;
-      if (!session || isLogoutPending(d.storage())) return;
+      if (!session || isLogoutPending(d.storage(), sessionKeyOf(session))) return;
       if (sessionKeyOf(session) !== startedFor || userIdOf(session) !== body.user_id) return;
       // Server role wins over the JWT claim. A non-web role must not use the dashboard.
       if (!isWebRole(body.role)) {
@@ -208,20 +213,27 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
     return meInFlightRef.current;
   }, []);
 
-  const runLogout = useCallback((timeoutMs: number): Promise<void> => {
+  const runLogout = useCallback((timeoutMs: number, sessionKey: string | null): Promise<void> => {
     if (logoutInFlightRef.current) return logoutInFlightRef.current;
     const d = depsRef.current;
     // Late responses of this session must not refresh, re-bind or show a banner (review R2).
-    if (sessionRef.current) d.markSessionEnded(sessionKeyOf(sessionRef.current));
+    if (sessionKey !== ANY_SESSION) d.markSessionEnded(sessionKey);
     const flow = performLogout(
       {
+        sessionKey: sessionKey === ANY_SESSION ? null : sessionKey,
         storage: d.storage(),
         // Mock mode has no backend: skip POST /auth/logout like POST /auth/session is skipped.
         callLogoutEndpoint: d.mode === 'mock' ? async () => undefined : d.callLogoutEndpoint,
         signOut: d.signOut,
       },
       timeoutMs,
-    ).then(() => applySession(null));
+    ).then(() => {
+      // A new sign-in may have happened meanwhile (R6): never "sign out" that session in the UI.
+      const current = sessionRef.current;
+      if (!current || sessionKey === ANY_SESSION || sessionKeyOf(current) === sessionKey) {
+        applySession(null);
+      }
+    });
     logoutInFlightRef.current = flow.finally(() => {
       logoutInFlightRef.current = null;
     });
@@ -242,19 +254,31 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
         applySession(null);
         return;
       }
-      // While a logout is pending, a session must never turn into protected UI.
-      if (isLogoutPending(d.storage())) return;
+      // While THIS session's logout is pending it must never turn into protected UI.
+      const pending = pendingLogoutKey(d.storage());
+      if (pending !== null) {
+        if (pending === ANY_SESSION || pending === sessionKeyOf(session)) return;
+        // A different session = a new sign-in: it ends the old pending logout (review R6), so a
+        // later reload does not log the new session out.
+        clearLogoutPending(d.storage());
+      }
       applySession(session);
     });
 
+    const pending = pendingLogoutKey(d.storage());
+    const stored = d.storedSessionKey();
+    if (pending !== null && pending !== ANY_SESSION && stored !== null && stored !== pending) {
+      // The flag belongs to an older session; the stored one is a newer sign-in (R6): keep it.
+      clearLogoutPending(d.storage());
+    }
     if (isLogoutPending(d.storage())) {
       // Interrupted logout (browser closed / reloaded during POST /auth/logout): finish it first.
       // Status stays "loading" until it is done, so no protected UI is rendered.
-      void runLogout(STARTUP_LOGOUT_TIMEOUT_MS);
+      void runLogout(STARTUP_LOGOUT_TIMEOUT_MS, pendingLogoutKey(d.storage()));
     } else {
       void d.getSession().then(
         (session) => {
-          if (!active || isLogoutPending(d.storage())) return;
+          if (!active || (session && isLogoutPending(d.storage(), sessionKeyOf(session)))) return;
           applySession(session);
           if (session) void checkMe();
         },
@@ -287,7 +311,7 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
       if (!sessionRef.current) return;
       // On /login a sign-in may be in progress (POST /auth/session not done yet).
       if (pathnameRef.current === '/login') return;
-      if (isLogoutPending(d.storage())) return;
+      if (isLogoutPending(d.storage(), sessionKeyOf(sessionRef.current))) return;
       const last = lastMeStartRef.current;
       if (last !== null && d.now() - last < ME_CHECK_MIN_INTERVAL_MS) return;
       void checkMe();
@@ -296,18 +320,21 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
     return () => document.removeEventListener('visibilitychange', handleVisibility);
   }, [checkMe]);
 
-  const logout = useCallback(() => runLogout(LOGOUT_TIMEOUT_MS), [runLogout]);
+  const logout = useCallback(
+    () =>
+      runLogout(LOGOUT_TIMEOUT_MS, sessionRef.current ? sessionKeyOf(sessionRef.current) : ANY_SESSION),
+    [runLogout],
+  );
 
   const revalidate = useCallback(async () => {
     const d = depsRef.current;
-    if (isLogoutPending(d.storage())) return;
     let session: Session | null;
     try {
       session = await d.getSession();
     } catch {
       session = null;
     }
-    if (isLogoutPending(d.storage())) return;
+    if (session && isLogoutPending(d.storage(), sessionKeyOf(session))) return;
     applySession(session);
   }, [applySession]);
 

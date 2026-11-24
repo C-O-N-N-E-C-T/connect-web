@@ -151,12 +151,14 @@ Backend calls go through `apiClient.request(path, options)` (`src/services/apiCl
 The "Çıkış yap" button (`AppLayout`) runs this flow:
 
 1. The button is disabled and shows "Çıkış yapılıyor…". Extra clicks are ignored.
-2. `localStorage['connect.logout_pending'] = '1'` is written **before** any network call.
+2. `localStorage['connect.logout_pending'] = <session_id>` is written **before** any network call. The value identifies the session being logged out.
 3. `POST /api/v1/auth/logout` runs with a 5 s timeout and recovery turned off. The flow continues whatever the outcome (network error, 5xx, 401, 403, 429, timeout).
 4. `supabase.auth.signOut({ scope: 'local' })`, limited to 3 s (see below).
 5. The flag is removed and the app navigates to `/login`.
 
 If the browser is closed or reloaded during step 3, the flag survives. On the next start, `AuthProvider` finishes the logout before showing anything: it tries `/auth/logout` once more with a 3 s timeout, signs out locally (again limited to 3 s), removes the flag and goes to `/login`. No protected screen is rendered meanwhile.
+
+The flag only ever applies to the session it names (R6). A new sign-in (a different `session_id`) clears it at once, so the new user is shown normally and a later reload does not log them out. A late finish of the old logout never signs out the new session. At startup, a flag naming an older session than the one stored is discarded.
 
 Every sign-out in the web app uses `scope: 'local'`. With the default `global` scope, a network or 5xx failure keeps the local session, so the user silently stays signed in. `global` would also end the user's sessions on other devices.
 

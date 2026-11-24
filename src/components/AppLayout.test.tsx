@@ -47,7 +47,7 @@ describe('AppLayout logout button (D1/D2)', () => {
 
     const busy = screen.getByRole('button', { name: 'Çıkış yapılıyor…' });
     expect(busy).toBeDisabled();
-    expect(window.localStorage.getItem(LOGOUT_PENDING_KEY)).toBe('1');
+    expect(window.localStorage.getItem(LOGOUT_PENDING_KEY)).toBe('sess-user-1');
     await user.click(busy);
     expect(deps.callLogoutEndpoint).toHaveBeenCalledOnce();
     expect(deps.callLogoutEndpoint).toHaveBeenCalledWith(5000);

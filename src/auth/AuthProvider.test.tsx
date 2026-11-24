@@ -7,8 +7,13 @@ import { RequireRole } from './RequireRole';
 import { LOGOUT_PENDING_KEY } from './logout';
 import { makeAuthDeps, sessionFor } from '../test/authTestUtils';
 
+let lastAuth: ReturnType<typeof useAuth> | null = null;
+const renderedAuth = () => lastAuth!;
+
 function Probe() {
-  const { status, role } = useAuth();
+  const auth = useAuth();
+  lastAuth = auth;
+  const { status, role } = auth;
   const location = useLocation();
   return (
     <p data-testid="probe">
@@ -320,6 +325,76 @@ describe('AuthProvider: interrupted logout at startup (D2)', () => {
     expect(await screen.findByText('LOGIN SCREEN')).toBeInTheDocument();
     expect(deps.callLogoutEndpoint).not.toHaveBeenCalled();
     expect(deps.signOut).toHaveBeenCalledOnce();
+  });
+});
+
+describe('AuthProvider: a new sign-in ends an old pending logout (R6)', () => {
+  it('applies a new sign-in while the old session\'s logout is still pending, and clears the flag', async () => {
+    let finishSignOut!: () => void;
+    const { deps, emit } = makeAuthDeps();
+    deps.getSession.mockResolvedValue(sessionFor('coordinator', 'user-a'));
+    // Slow local sign-out of A: SIGNED_OUT already fired, the promise has not resolved yet.
+    deps.signOut.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          emit('SIGNED_OUT', null);
+          finishSignOut = resolve;
+        }),
+    );
+    renderApp(deps);
+    await waitFor(() => expect(probe()).toBe('signedIn|coordinator|/dashboard'));
+
+    let logout!: Promise<void>;
+    act(() => {
+      logout = renderedAuth().logout();
+    });
+    await waitFor(() => expect(probe()).toBe('signedOut|-|/login'));
+    expect(window.localStorage.getItem(LOGOUT_PENDING_KEY)).toBe('sess-user-a');
+
+    // The next coordinator signs in on the same PC.
+    act(() => emit('SIGNED_IN', sessionFor('administrator', 'user-b')));
+    expect(probe()).toBe('signedIn|administrator|/login');
+    expect(window.localStorage.getItem(LOGOUT_PENDING_KEY)).toBeNull();
+
+    // A's logout finishes late: B stays signed in.
+    await act(async () => {
+      finishSignOut();
+      await logout;
+    });
+    expect(probe()).toBe('signedIn|administrator|/login');
+  });
+
+  it('does not log out a newer stored session at startup when the flag belongs to an older one', async () => {
+    window.localStorage.setItem(LOGOUT_PENDING_KEY, 'sess-user-a');
+    const { deps } = makeAuthDeps({ mode: 'mock' });
+    deps.storedSessionKey.mockReturnValue('sess-user-b');
+    deps.getSession.mockResolvedValue(sessionFor('coordinator', 'user-b'));
+    renderApp(deps);
+    expect(await screen.findByText('PANEL CONTENT')).toBeInTheDocument();
+    expect(deps.signOut).not.toHaveBeenCalled();
+    expect(deps.callLogoutEndpoint).not.toHaveBeenCalled();
+    expect(window.localStorage.getItem(LOGOUT_PENDING_KEY)).toBeNull();
+  });
+
+  it('still finishes the logout at startup when the flag matches the stored session', async () => {
+    window.localStorage.setItem(LOGOUT_PENDING_KEY, 'sess-user-a');
+    const { deps } = makeAuthDeps();
+    deps.storedSessionKey.mockReturnValue('sess-user-a');
+    renderApp(deps);
+    expect(await screen.findByText('LOGIN SCREEN')).toBeInTheDocument();
+    expect(deps.signOut).toHaveBeenCalledOnce();
+    expect(deps.markSessionEnded).toHaveBeenCalledWith('sess-user-a');
+  });
+
+  it('ignores the session being logged out (same session) while the flag is set', async () => {
+    window.localStorage.setItem(LOGOUT_PENDING_KEY, 'sess-user-a');
+    const { deps, emit } = makeAuthDeps();
+    deps.storedSessionKey.mockReturnValue('sess-user-a');
+    deps.callLogoutEndpoint.mockReturnValue(new Promise(() => undefined));
+    renderApp(deps);
+    act(() => emit('SIGNED_IN', sessionFor('coordinator', 'user-a', 'refocus')));
+    expect(probe()).toBe('loading|-|/dashboard');
+    expect(window.localStorage.getItem(LOGOUT_PENDING_KEY)).toBe('sess-user-a');
   });
 });
 
