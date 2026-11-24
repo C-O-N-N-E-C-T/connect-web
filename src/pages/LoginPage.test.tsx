@@ -5,6 +5,7 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { validateLoginForm, LoginPage } from './LoginPage';
 import { createForcedSignOut, SIGNOUT_REASON_KEY } from '../auth/forcedSignOut';
+import { blockStorage, restoreStorage } from '../test/blockStorage';
 
 const mocks = vi.hoisted(() => ({
   signInWithPassword: vi.fn(),
@@ -202,5 +203,25 @@ describe('LoginPage: forced sign-out reason (OSP-70)', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('Bu cihazın erişimi iptal edildi.');
     await submitCredentials('a@b.co', 'pw');
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+});
+
+describe('LoginPage with blocked storage (R11)', () => {
+  it('renders and signs in without touching storage errors', async () => {
+    blockStorage();
+    try {
+      mocks.signInWithPassword.mockResolvedValue({
+        data: { session: { access_token: tokenFor({ user_role: 'coordinator' }) } },
+        error: null,
+      });
+      mocks.registerBrowserSession.mockResolvedValue({ ok: true });
+      renderLogin();
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      await submitCredentials('coordinator@gmail.com', 'pw');
+      await waitFor(() => expect(mocks.registerBrowserSession).toHaveBeenCalledOnce());
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    } finally {
+      restoreStorage();
+    }
   });
 });

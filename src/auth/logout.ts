@@ -18,6 +18,7 @@
  * revocation. Known limits: the LOGOUT audit row is client-initiated and can be suppressed, and a
  * copied access token stays usable until it expires if /auth/logout did not succeed.
  */
+import { safeLocalStorage, storageGet, storageRemove, storageSet } from '../lib/storage';
 
 export const LOGOUT_PENDING_KEY = 'connect.logout_pending';
 
@@ -27,27 +28,21 @@ export const LOGOUT_TIMEOUT_MS = 5_000;
 export const STARTUP_LOGOUT_TIMEOUT_MS = 3_000;
 
 export interface LogoutDeps {
-  storage: Storage;
+  /** localStorage, or null when storage is blocked (the flag is then simply unavailable). */
+  storage: Storage | null;
   /** POST /api/v1/auth/logout with recovery disabled. May reject; the result is ignored. */
   callLogoutEndpoint(timeoutMs: number): Promise<unknown>;
   /** `signOut({ scope: 'local' })`. */
   signOut(): Promise<void>;
 }
 
-export function isLogoutPending(storage: Storage = window.localStorage): boolean {
-  try {
-    return storage.getItem(LOGOUT_PENDING_KEY) !== null;
-  } catch {
-    return false;
-  }
+export function isLogoutPending(storage: Storage | null = safeLocalStorage()): boolean {
+  return storageGet(storage, LOGOUT_PENDING_KEY) !== null;
 }
 
 export async function performLogout(deps: LogoutDeps, timeoutMs: number): Promise<void> {
-  try {
-    deps.storage.setItem(LOGOUT_PENDING_KEY, '1');
-  } catch {
-    // Storage unavailable: the logout itself must still go on.
-  }
+  // Storage unavailable: the logout itself must still go on.
+  storageSet(deps.storage, LOGOUT_PENDING_KEY, '1');
   try {
     await deps.callLogoutEndpoint(timeoutMs);
   } catch {
@@ -58,9 +53,5 @@ export async function performLogout(deps: LogoutDeps, timeoutMs: number): Promis
   } catch {
     // signOut({ scope: 'local' }) removes the local session before any network call.
   }
-  try {
-    deps.storage.removeItem(LOGOUT_PENDING_KEY);
-  } catch {
-    // ignore
-  }
+  storageRemove(deps.storage, LOGOUT_PENDING_KEY);
 }

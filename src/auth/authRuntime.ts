@@ -3,6 +3,7 @@
  * The building blocks themselves are dependency-injected and unit-tested in isolation.
  */
 import { supabase } from '../lib/supabase';
+import { safeLocalStorage, safeSessionStorage } from '../lib/storage';
 import { createApiClient } from '../services/apiClient';
 import { registerBrowserSession } from '../services/authSessionClient';
 import { getOrCreateDeviceId } from '../services/deviceId';
@@ -38,7 +39,7 @@ export const forceSignOut = createForcedSignOut({
   signOut: signOutLocal,
   // Without a registered navigator the route guard still redirects on SIGNED_OUT.
   navigateToLogin: () => loginNavigator?.(),
-  storage: () => window.sessionStorage,
+  storage: safeSessionStorage,
 });
 
 export const apiClient = createApiClient({
@@ -80,7 +81,7 @@ export const defaultAuthDeps: AuthProviderDeps = {
   signOut: signOutLocal,
   forceSignOut,
   setLoginNavigator,
-  storage: () => window.localStorage,
+  storage: safeLocalStorage,
   mode: import.meta.env.VITE_AUTH_SESSION_MODE,
   now: () => Date.now(),
 };

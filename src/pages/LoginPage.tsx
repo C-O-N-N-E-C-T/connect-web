@@ -8,6 +8,7 @@ import {
 } from '../auth/login';
 import { supabase } from '../lib/supabase';
 import { clearSignOutReason, peekSignOutReason, subscribeSignOutReason } from '../auth/forcedSignOut';
+import { safeSessionStorage } from '../lib/storage';
 import { getOrCreateDeviceId } from '../services/deviceId';
 import { registerBrowserSession } from '../services/authSessionClient';
 import { SupplementaryDisclaimer } from '../components/SupplementaryDisclaimer';
@@ -31,17 +32,17 @@ export function LoginPage() {
   // Reason of a forced sign-out (OSP-70): read once, cleared in the effect below. Reading in the
   // initializer and clearing in an effect keeps it visible under StrictMode's double invocation.
   const [bannerError, setBannerError] = useState<LoginErrorCode | null>(() =>
-    peekSignOutReason(window.sessionStorage),
+    peekSignOutReason(safeSessionStorage()),
   );
   const [submitting, setSubmitting] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
 
   useEffect(() => {
-    clearSignOutReason(window.sessionStorage);
+    clearSignOutReason(safeSessionStorage());
     // A forced sign-out while this page is already mounted (e.g. the SDK dropped the session first).
     return subscribeSignOutReason((reason) => {
       setBannerError(reason);
-      clearSignOutReason(window.sessionStorage);
+      clearSignOutReason(safeSessionStorage());
     });
   }, []);
 

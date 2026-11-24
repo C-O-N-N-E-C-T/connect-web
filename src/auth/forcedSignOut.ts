@@ -20,6 +20,8 @@ export type ForcedSignOutReason =
   | 'ROLE_NOT_ALLOWED'
   | 'SESSION_EXPIRED';
 
+import { storageGet, storageRemove, storageSet } from '../lib/storage';
+
 export const SIGNOUT_REASON_KEY = 'connect.signout_reason';
 
 const REASONS: ReadonlySet<string> = new Set<ForcedSignOutReason>([
@@ -45,38 +47,29 @@ export function subscribeSignOutReason(listener: ReasonListener): () => void {
   };
 }
 
-export function storeSignOutReason(storage: Storage, reason: ForcedSignOutReason): void {
-  try {
-    storage.setItem(SIGNOUT_REASON_KEY, reason);
-  } catch {
-    // Storage may be unavailable (private mode, quota). The sign-out itself must still happen.
-  }
+export function storeSignOutReason(storage: Storage | null, reason: ForcedSignOutReason): void {
+  // Storage may be unavailable (blocked, quota). The sign-out itself must still happen; an
+  // already-mounted login page still gets the reason through the subscription below.
+  storageSet(storage, SIGNOUT_REASON_KEY, reason);
   reasonListeners.forEach((listener) => listener(reason));
 }
 
 /** Reads the stored reason without removing it (safe to call twice under StrictMode). */
-export function peekSignOutReason(storage: Storage): ForcedSignOutReason | null {
-  try {
-    const value = storage.getItem(SIGNOUT_REASON_KEY);
-    return isForcedSignOutReason(value) ? value : null;
-  } catch {
-    return null;
-  }
+export function peekSignOutReason(storage: Storage | null): ForcedSignOutReason | null {
+  const value = storageGet(storage, SIGNOUT_REASON_KEY);
+  return isForcedSignOutReason(value) ? value : null;
 }
 
-export function clearSignOutReason(storage: Storage): void {
-  try {
-    storage.removeItem(SIGNOUT_REASON_KEY);
-  } catch {
-    // ignore
-  }
+export function clearSignOutReason(storage: Storage | null): void {
+  storageRemove(storage, SIGNOUT_REASON_KEY);
 }
 
 export interface ForcedSignOutDeps {
   /** Must sign out with `scope: 'local'` and must not throw. */
   signOut(): Promise<void>;
   navigateToLogin(): void;
-  storage(): Storage;
+  /** sessionStorage, or null when storage is blocked. */
+  storage(): Storage | null;
 }
 
 export type ForceSignOut = (reason: ForcedSignOutReason, accessToken: string | null) => Promise<void>;

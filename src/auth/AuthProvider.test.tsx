@@ -278,6 +278,16 @@ describe('AuthProvider: StrictMode (double effects in development)', () => {
   });
 });
 
+describe('AuthProvider with blocked storage (R11)', () => {
+  it('restores the session without a usable storage', async () => {
+    const { deps } = makeAuthDeps({ storage: () => null });
+    deps.getSession.mockResolvedValue(sessionFor('coordinator'));
+    renderApp(deps);
+    await waitFor(() => expect(probe()).toBe('signedIn|coordinator|/dashboard'));
+    expect(screen.getByText('PANEL CONTENT')).toBeInTheDocument();
+  });
+});
+
 describe('useAuth', () => {
   it('throws outside the provider', () => {
     const spy = vi.spyOn(console, 'error').mockImplementation(() => undefined);

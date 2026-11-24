@@ -55,8 +55,8 @@ export interface AuthProviderDeps {
   signOut(): Promise<void>;
   forceSignOut: ForceSignOut;
   setLoginNavigator(navigateToLogin: () => void): () => void;
-  /** localStorage (holds the logout-pending flag). */
-  storage(): Storage;
+  /** localStorage (holds the logout-pending flag), or null when storage is blocked. */
+  storage(): Storage | null;
   /** VITE_AUTH_SESSION_MODE. In `mock` mode no backend call is made. */
   mode: string | undefined;
   now(): number;
