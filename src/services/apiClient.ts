@@ -177,8 +177,8 @@ export function createApiClient(deps: ApiClientDeps): ApiClient {
 
   // Single-flight per session: concurrent callers of the SAME session share one attempt. The slot
   // is cleared when the attempt settles; every attempt is bounded by RECOVERY_TIMEOUT_MS (R8), so
-  // a hung one cannot keep it. A failure is never cached by this client (see README for the SDK's
-  // own 60 s refresh-failure cooldown, R3).
+  // a hung one cannot keep it. This client caches no failure, but supabase-js serves a failed
+  // refresh (transient ones too) from its own cache for up to 60 s (review R3, README).
   let refreshFlight: { owner: string; promise: Promise<Recovery> } | null = null;
   let rebindFlight: { owner: string; promise: Promise<RebindOutcome> } | null = null;
 

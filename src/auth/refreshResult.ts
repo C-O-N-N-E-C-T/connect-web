@@ -9,11 +9,18 @@
  * - `session_not_found` or no refresh token -> AuthSessionMissingError (status 400).
  * - A refresh discarded because the stored session changed meanwhile (e.g. concurrent sign-out or
  *   another tab rotated the token) -> AuthRefreshDiscardedError (409).
- * refreshSession() returns these as `{ error }`; it throws only for non-auth errors (e.g. a lock
- * timeout).
+ * refreshSession() returns these as `{ error }`; it throws only for unexpected non-auth errors
+ * (this app's client is lockless, so there is no lock timeout).
  *
  * Definitive (sign out): a 4xx AuthApiError other than 429, a missing session, or success without
- * a session. Everything else is transient: the user stays signed in and the next request retries.
+ * a session. Everything else is transient: the user stays signed in.
+ *
+ * Caching (review R3, verified in `_callRefreshToken`'s catch block): auth-js caches EVERY
+ * refresh failure that is an AuthError, transient ones included, for REFRESH_FAILURE_COOLDOWN_MS
+ * = 60 s per refresh token (`lastRefreshFailure`). During that window refreshSession() and an
+ * expiring getSession() return the cached error without a network call. So after a short outage
+ * requests may keep failing (NETWORK_ERROR / SERVER_ERROR / TIMEOUT) for up to 60 s although the
+ * network is back; nobody is signed out. This client caches nothing itself.
  */
 import {
   isAuthApiError,
