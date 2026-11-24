@@ -25,3 +25,4 @@ class MemoryStorage implements Storage {
 }
 
 Object.defineProperty(window, 'localStorage', { value: new MemoryStorage(), configurable: true });
+Object.defineProperty(window, 'sessionStorage', { value: new MemoryStorage(), configurable: true });
