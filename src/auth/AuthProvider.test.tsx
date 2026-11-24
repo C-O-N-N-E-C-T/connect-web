@@ -249,6 +249,24 @@ describe('AuthProvider: interrupted logout at startup (D2)', () => {
     expect(window.localStorage.getItem(LOGOUT_PENDING_KEY)).toBeNull();
   });
 
+  it('ends on /login within the bound even if signOut hangs (R1)', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      window.localStorage.setItem(LOGOUT_PENDING_KEY, '1');
+      const { deps } = makeAuthDeps();
+      deps.signOut.mockReturnValue(new Promise(() => undefined));
+      renderApp(deps);
+      expect(screen.getByText('Yükleniyor…')).toBeInTheDocument();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3_600);
+      });
+      expect(await screen.findByText('LOGIN SCREEN')).toBeInTheDocument();
+      expect(window.localStorage.getItem(LOGOUT_PENDING_KEY)).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('skips the backend call in mock mode but still signs out', async () => {
     window.localStorage.setItem(LOGOUT_PENDING_KEY, '1');
     const { deps } = makeAuthDeps({ mode: 'mock' });

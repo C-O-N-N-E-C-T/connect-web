@@ -12,6 +12,8 @@
  *
  * This path never calls POST /auth/logout: the token has already been rejected by the backend.
  */
+import { withDeadline } from '../lib/deadline';
+import { storageGet, storageRemove, storageSet } from '../lib/storage';
 
 export type ForcedSignOutReason =
   | 'DEVICE_REVOKED'
@@ -20,7 +22,8 @@ export type ForcedSignOutReason =
   | 'ROLE_NOT_ALLOWED'
   | 'SESSION_EXPIRED';
 
-import { storageGet, storageRemove, storageSet } from '../lib/storage';
+/** Outer guard; the app's signOut (signOutLocal) is itself bounded to 3 s. */
+const SIGN_OUT_GUARD_MS = 3_500;
 
 export const SIGNOUT_REASON_KEY = 'connect.signout_reason';
 
@@ -65,7 +68,7 @@ export function clearSignOutReason(storage: Storage | null): void {
 }
 
 export interface ForcedSignOutDeps {
-  /** Must sign out with `scope: 'local'` and must not throw. */
+  /** Must sign out with `scope: 'local'`; expected to be bounded (signOutLocal is). */
   signOut(): Promise<void>;
   navigateToLogin(): void;
   /** sessionStorage, or null when storage is blocked. */
@@ -98,11 +101,11 @@ export function createForcedSignOut(deps: ForcedSignOutDeps): ForceSignOut {
     inFlight = (async () => {
       try {
         storeSignOutReason(deps.storage(), reason);
-        try {
-          await deps.signOut();
-        } catch {
-          // signOut({ scope: 'local' }) removes the local session first; keep going regardless.
-        }
+        // Bounded like the logout (review R1): navigate even if signOut hangs or throws.
+        await withDeadline(
+          deps.signOut().catch(() => undefined),
+          SIGN_OUT_GUARD_MS,
+        );
         deps.navigateToLogin();
       } finally {
         inFlight = null;

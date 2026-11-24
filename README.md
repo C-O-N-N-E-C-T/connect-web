@@ -150,12 +150,14 @@ The "Çıkış yap" button (`AppLayout`) runs this flow:
 1. The button is disabled and shows "Çıkış yapılıyor…". Extra clicks are ignored.
 2. `localStorage['connect.logout_pending'] = '1'` is written **before** any network call.
 3. `POST /api/v1/auth/logout` runs with a 5 s timeout and recovery turned off. The flow continues whatever the outcome (network error, 5xx, 401, 403, 429, timeout).
-4. `supabase.auth.signOut({ scope: 'local' })`.
+4. `supabase.auth.signOut({ scope: 'local' })`, limited to 3 s (see below).
 5. The flag is removed and the app navigates to `/login`.
 
-If the browser is closed or reloaded during step 3, the flag survives. On the next start, `AuthProvider` finishes the logout before showing anything: it tries `/auth/logout` once more with a 3 s timeout, signs out locally, removes the flag and goes to `/login`. No protected screen is rendered meanwhile.
+If the browser is closed or reloaded during step 3, the flag survives. On the next start, `AuthProvider` finishes the logout before showing anything: it tries `/auth/logout` once more with a 3 s timeout, signs out locally (again limited to 3 s), removes the flag and goes to `/login`. No protected screen is rendered meanwhile.
 
 Every sign-out in the web app uses `scope: 'local'`. With the default `global` scope, a network or 5xx failure keeps the local session, so the user silently stays signed in. `global` would also end the user's sessions on other devices.
+
+`signOut({ scope: 'local' })` is not network-free. When the stored token expires within 90 s, supabase-js first refreshes it, retrying with no fetch timeout, and only then removes the session. It then waits for Supabase `POST /logout`, also with no timeout. Every sign-out (the logout button, an interrupted logout at startup, a forced sign-out) therefore waits at most 3 s. If `signOut` has not finished by then, or the same session is still stored afterwards, the app removes the persisted Supabase session itself (`sb-<project>-auth-token`, set explicitly in `src/lib/supabase.ts` to the supabase-js default) and the app treats the user as signed out. A session that another sign-in stored meanwhile is never removed. The worst-case logout is therefore about 5 s (`/auth/logout`) plus 3 s.
 
 ### Known limits
 

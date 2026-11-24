@@ -5,6 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AuthApiError, AuthRetryableFetchError } from '@supabase/supabase-js';
 import { SIGNOUT_REASON_KEY } from './forcedSignOut';
+import { tokenFor } from '../test/authTestUtils';
 
 const mocks = vi.hoisted(() => ({
   signOut: vi.fn(),
@@ -15,6 +16,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('../lib/supabase', () => ({
+  SUPABASE_AUTH_STORAGE_KEY: 'sb-test-auth-token',
   supabase: {
     auth: {
       signOut: mocks.signOut,
@@ -145,5 +147,71 @@ describe('authRuntime', () => {
   it('defaultAuthDeps.signOut is the local sign-out', async () => {
     await defaultAuthDeps.signOut();
     expect(mocks.signOut).toHaveBeenCalledWith({ scope: 'local' });
+  });
+
+});
+
+describe('signOutLocal is bounded (R1)', () => {
+  const KEY = 'sb-test-auth-token';
+  const stored = (sessionId: string) =>
+    JSON.stringify({ access_token: tokenFor({ sub: 'u', session_id: sessionId }), refresh_token: 'r' });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('removes the persisted session itself and emits SIGNED_OUT when signOut hangs', async () => {
+    vi.useFakeTimers();
+    window.localStorage.setItem(KEY, stored('s-1'));
+    window.localStorage.setItem(`${KEY}-user`, '{}');
+    mocks.signOut.mockReturnValue(new Promise(() => undefined)); // e.g. refresh hangs offline
+    const callback = vi.fn();
+    const unsubscribe = defaultAuthDeps.onAuthStateChange(callback);
+
+    let finished = false;
+    const done = signOutLocal().then(() => (finished = true));
+    await vi.advanceTimersByTimeAsync(2_999);
+    expect(finished).toBe(false);
+    expect(window.localStorage.getItem(KEY)).not.toBeNull();
+
+    await vi.advanceTimersByTimeAsync(1);
+    await done;
+    expect(window.localStorage.getItem(KEY)).toBeNull();
+    expect(window.localStorage.getItem(`${KEY}-user`)).toBeNull();
+    expect(callback).toHaveBeenCalledWith('SIGNED_OUT', null);
+    unsubscribe();
+  });
+
+  it('removes the session when signOut returned but left the same session stored', async () => {
+    window.localStorage.setItem(KEY, stored('s-1'));
+    mocks.signOut.mockResolvedValue({ error: { name: 'AuthApiError', status: 400 } });
+    await signOutLocal();
+    expect(window.localStorage.getItem(KEY)).toBeNull();
+  });
+
+  it('does not touch storage when signOut removed the session itself', async () => {
+    window.localStorage.setItem(KEY, stored('s-1'));
+    mocks.signOut.mockImplementation(async () => {
+      window.localStorage.removeItem(KEY);
+      return { error: null };
+    });
+    const callback = vi.fn();
+    const unsubscribe = defaultAuthDeps.onAuthStateChange(callback);
+    await signOutLocal();
+    expect(callback).not.toHaveBeenCalled(); // supabase-js emits SIGNED_OUT itself
+    unsubscribe();
+  });
+
+  it('never removes a session another login stored meanwhile', async () => {
+    vi.useFakeTimers();
+    window.localStorage.setItem(KEY, stored('s-1'));
+    mocks.signOut.mockImplementation(() => {
+      window.localStorage.setItem(KEY, stored('s-2')); // a new sign-in replaced the session
+      return new Promise(() => undefined);
+    });
+    const done = signOutLocal();
+    await vi.advanceTimersByTimeAsync(3_000);
+    await done;
+    expect(window.localStorage.getItem(KEY)).toBe(stored('s-2'));
   });
 });

@@ -71,6 +71,20 @@ describe('createForcedSignOut', () => {
     expect(deps.navigateToLogin).toHaveBeenCalledOnce();
   });
 
+  it('still navigates when signOut hangs (R1)', async () => {
+    vi.useFakeTimers();
+    try {
+      const { deps } = makeDeps();
+      deps.signOut.mockReturnValueOnce(new Promise(() => undefined));
+      const done = createForcedSignOut(deps)('SESSION_EXPIRED', 'tok-hang');
+      await vi.advanceTimersByTimeAsync(3_500);
+      await done;
+      expect(deps.navigateToLogin).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('notifies reason subscribers', async () => {
     const { deps } = makeDeps();
     const listener = vi.fn();

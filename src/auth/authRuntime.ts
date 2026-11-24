@@ -2,26 +2,67 @@
  * App wiring of the auth building blocks (Supabase client, forced sign-out, API client).
  * The building blocks themselves are dependency-injected and unit-tested in isolation.
  */
-import { supabase } from '../lib/supabase';
-import { safeLocalStorage, safeSessionStorage } from '../lib/storage';
+import type { AuthChangeEvent, Session } from '@supabase/supabase-js';
+import { SUPABASE_AUTH_STORAGE_KEY, supabase } from '../lib/supabase';
+import { decodeJwtClaims } from '../lib/jwt';
+import { withDeadline } from '../lib/deadline';
+import {
+  safeLocalStorage,
+  safeSessionStorage,
+  storageGet,
+  storageRemove,
+} from '../lib/storage';
 import { createApiClient } from '../services/apiClient';
 import { registerBrowserSession } from '../services/authSessionClient';
 import { getOrCreateDeviceId } from '../services/deviceId';
 import { createForcedSignOut } from './forcedSignOut';
-import { isLogoutPending } from './logout';
+import { isLogoutPending, SIGN_OUT_TIMEOUT_MS } from './logout';
 import { classifyRefresh } from './refreshResult';
 import type { AuthProviderDeps } from './AuthProvider';
+
+type AuthListener = (event: AuthChangeEvent, session: Session | null) => void;
+const localSignOutListeners = new Set<AuthListener>();
+
+/** Identity (session_id, else sub) of the session persisted by supabase-js, or null. */
+function storedSessionKey(storage: Storage | null): string | null {
+  const raw = storageGet(storage, SUPABASE_AUTH_STORAGE_KEY);
+  if (!raw) return null;
+  try {
+    const token = (JSON.parse(raw) as { access_token?: unknown }).access_token;
+    if (typeof token !== 'string') return raw;
+    const claims = decodeJwtClaims(token);
+    const key = claims.session_id ?? claims.sub;
+    return typeof key === 'string' ? key : raw;
+  } catch {
+    return raw;
+  }
+}
 
 /**
  * Every sign-out in the web app uses `scope: 'local'` (design D2): with the default `global`
  * scope a network/5xx failure keeps the local session (the user silently stays signed in) and it
- * would also revoke the user's other sessions. Never throws.
+ * would also revoke the user's other sessions.
+ *
+ * Bounded (review R1): `signOut({ scope: 'local' })` is NOT network-free. auth-js 2.119.2 first
+ * loads the session, which refreshes the token if it expires within 90 s (retrying, no fetch
+ * timeout), and then awaits `POST /logout` without a timeout. So it is raced against
+ * SIGN_OUT_TIMEOUT_MS. If it has not finished by then, or it returned while the same session is
+ * still stored (auth-js keeps a still-valid session when a proactive refresh is rejected), the
+ * persisted session is removed here directly and subscribers get SIGNED_OUT. Never throws.
  */
 export async function signOutLocal(): Promise<void> {
-  try {
-    await supabase.auth.signOut({ scope: 'local' });
-  } catch {
-    // The local session is removed before the server call; nothing else to do.
+  const storage = safeLocalStorage();
+  const before = storedSessionKey(storage);
+  const done = supabase.auth.signOut({ scope: 'local' }).then(
+    () => undefined,
+    () => undefined,
+  );
+  await withDeadline(done, SIGN_OUT_TIMEOUT_MS);
+  // Only remove what we set out to sign out: never a session another login stored meanwhile.
+  if (before !== null && storedSessionKey(storage) === before) {
+    storageRemove(storage, SUPABASE_AUTH_STORAGE_KEY);
+    storageRemove(storage, `${SUPABASE_AUTH_STORAGE_KEY}-user`);
+    localSignOutListeners.forEach((listener) => listener('SIGNED_OUT', null));
   }
 }
 
@@ -73,7 +114,12 @@ export const defaultAuthDeps: AuthProviderDeps = {
   },
   onAuthStateChange: (callback) => {
     const { data } = supabase.auth.onAuthStateChange(callback);
-    return () => data.subscription.unsubscribe();
+    // Also hear sign-outs that signOutLocal completed itself (supabase-js emits nothing then).
+    localSignOutListeners.add(callback);
+    return () => {
+      data.subscription.unsubscribe();
+      localSignOutListeners.delete(callback);
+    };
   },
   fetchMe: () => apiClient.request<AuthMeResponse>('/api/v1/auth/me'),
   callLogoutEndpoint: (timeoutMs) =>

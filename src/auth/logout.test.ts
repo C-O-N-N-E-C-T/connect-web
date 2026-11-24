@@ -40,6 +40,24 @@ describe('performLogout', () => {
   });
 });
 
+describe('performLogout is bounded (R1)', () => {
+  it.each([
+    ['hangs', () => new Promise<void>(() => undefined)],
+    ['throws', () => Promise.reject(new Error('boom'))],
+  ])('finishes and clears the flag when signOut %s', async (_name, signOutImpl) => {
+    vi.useFakeTimers();
+    let finished = false;
+    const done = performLogout(
+      { storage: window.localStorage, callLogoutEndpoint: async () => undefined, signOut: vi.fn(signOutImpl) },
+      LOGOUT_TIMEOUT_MS,
+    ).then(() => (finished = true));
+    await vi.advanceTimersByTimeAsync(3_500);
+    await done;
+    expect(finished).toBe(true);
+    expect(window.localStorage.getItem(LOGOUT_PENDING_KEY)).toBeNull();
+  });
+});
+
 /**
  * Logout through the real API client (recovery disabled), with a fake fetch: every outcome must
  * still end in signOut, and no refresh / re-bind / forced sign-out may happen.

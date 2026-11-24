@@ -32,6 +32,7 @@
  */
 import type { ForcedSignOutReason } from '../auth/forcedSignOut';
 import type { RegisterSessionResult } from './authSessionClient';
+import { TIMED_OUT, withDeadline } from '../lib/deadline';
 
 export const DEFAULT_TIMEOUT_MS = 15_000;
 
@@ -300,17 +301,6 @@ function classifyRebind(result: RegisterSessionResult): RebindOutcome {
   return { ok: false, error };
 }
 
-const TIMED_OUT = Symbol('timed out');
-
-/** Resolves to TIMED_OUT if `promise` has not settled within `ms`. */
-function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
-  if (ms <= 0) return Promise.resolve(TIMED_OUT);
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const expired = new Promise<typeof TIMED_OUT>((resolve) => {
-    timer = setTimeout(() => resolve(TIMED_OUT), ms);
-  });
-  return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
-}
 
 function terminalReason(attempt: Attempt): ForcedSignOutReason | null {
   if (attempt.type !== 'response' || attempt.status !== 403) return null;
