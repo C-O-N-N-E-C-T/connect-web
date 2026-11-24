@@ -442,3 +442,10 @@ describe('apiClient: recovery disabled (logout)', () => {
     expect(deps.forceSignOut).not.toHaveBeenCalled();
   });
 });
+
+describe('ROLE_FORBIDDEN_MESSAGE', () => {
+  it('is the agreed Turkish text', async () => {
+    const { ROLE_FORBIDDEN_MESSAGE } = await import('./apiClient');
+    expect(ROLE_FORBIDDEN_MESSAGE).toBe('Bu işlem için yetkiniz yok.');
+  });
+});

@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { validateLoginForm, LoginPage } from './LoginPage';
+import { createForcedSignOut, SIGNOUT_REASON_KEY } from '../auth/forcedSignOut';
 
 const mocks = vi.hoisted(() => ({
   signInWithPassword: vi.fn(),
@@ -45,6 +46,7 @@ async function submitCredentials(email: string, password: string) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  window.sessionStorage.clear();
   mocks.signOut.mockResolvedValue({ error: null });
 });
 
@@ -105,6 +107,7 @@ describe('LoginPage', () => {
       'Saha kurtarıcı hesapları web panelinden giriş yapamaz.',
     );
     expect(mocks.signOut).toHaveBeenCalledOnce();
+    expect(mocks.signOut).toHaveBeenCalledWith({ scope: 'local' });
     expect(mocks.registerBrowserSession).not.toHaveBeenCalled();
   });
 
@@ -123,6 +126,7 @@ describe('LoginPage', () => {
 
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(message));
     expect(mocks.signOut).toHaveBeenCalledOnce();
+    expect(mocks.signOut).toHaveBeenCalledWith({ scope: 'local' });
   });
 
   it('links the email validation error to its input', async () => {
@@ -135,5 +139,54 @@ describe('LoginPage', () => {
     expect(input).toHaveAttribute('aria-invalid', 'true');
     expect(input).toHaveAttribute('aria-describedby', 'form-error');
     expect(mocks.signInWithPassword).not.toHaveBeenCalled();
+  });
+});
+
+describe('LoginPage: forced sign-out reason (OSP-70)', () => {
+  it.each([
+    ['DEVICE_REVOKED', 'Bu cihazın erişimi iptal edildi.'],
+    ['ACCOUNT_DISABLED', 'Hesabınız devre dışı bırakıldı. Yöneticinize başvurun.'],
+    ['SESSION_NOT_BOUND', 'Oturum cihaza bağlanamadı. Tekrar giriş yapın.'],
+    ['ROLE_NOT_ALLOWED', 'Saha kurtarıcı hesapları web panelinden giriş yapamaz.'],
+    ['SESSION_EXPIRED', 'Oturumunuzun süresi doldu. Lütfen tekrar giriş yapın.'],
+  ])('shows the reason %s once, then clears it', (reason, message) => {
+    window.sessionStorage.setItem(SIGNOUT_REASON_KEY, reason);
+    const first = renderLogin();
+    expect(screen.getByRole('alert')).toHaveTextContent(message);
+    expect(window.sessionStorage.getItem(SIGNOUT_REASON_KEY)).toBeNull();
+
+    first.unmount();
+    renderLogin();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('ignores an unknown stored value', () => {
+    window.sessionStorage.setItem(SIGNOUT_REASON_KEY, 'ANYTHING');
+    renderLogin();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('shows a reason that arrives while the page is already open', async () => {
+    renderLogin();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+
+    const force = createForcedSignOut({
+      signOut: async () => undefined,
+      navigateToLogin: () => undefined,
+      storage: () => window.sessionStorage,
+    });
+    await act(() => force('SESSION_EXPIRED', 'tok'));
+
+    expect(screen.getByRole('alert')).toHaveTextContent('Oturumunuzun süresi doldu.');
+    expect(window.sessionStorage.getItem(SIGNOUT_REASON_KEY)).toBeNull();
+  });
+
+  it('hides the reason when the user submits again', async () => {
+    window.sessionStorage.setItem(SIGNOUT_REASON_KEY, 'DEVICE_REVOKED');
+    mocks.signInWithPassword.mockReturnValue(new Promise(() => undefined));
+    renderLogin();
+    expect(screen.getByRole('alert')).toHaveTextContent('Bu cihazın erişimi iptal edildi.');
+    await submitCredentials('a@b.co', 'pw');
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 });
