@@ -163,7 +163,7 @@ Every sign-out in the web app uses `scope: 'local'`. With the default `global` s
 - The `LOGOUT` audit row is written only when the client reaches `/auth/logout`, so it can be suppressed.
 - If `/auth/logout` did not succeed, a copied access token stays usable at the backend until it expires.
 - A revoked device is noticed on the next backend call: on start, when the tab becomes visible again, or on any later API call. There is no polling.
-- `/api/v1/auth/*` is rate-limited to 10 requests per minute per IP. Visibility checks share this budget with login and logout, also with other users behind the same NAT. A 429 is a typed error and does not sign the user out.
+- `/api/v1/auth/*` is rate-limited to 10 requests per minute per IP, but the backend exempts `GET /api/v1/auth/me` (team decision, backend branch `OSP-70`), so visibility checks do not use up the login/logout budget of users behind the same NAT. Rebind (`POST /auth/session`) and logout still count. A 429 is a typed error and does not sign the user out.
 
 ## Project structure
 
