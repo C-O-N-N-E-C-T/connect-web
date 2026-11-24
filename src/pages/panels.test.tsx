@@ -14,6 +14,7 @@ function withAuth(children: ReactNode) {
           status: 'signedIn',
           session: null,
           role: 'administrator',
+          connectionProblem: false,
           logout: vi.fn().mockResolvedValue(undefined),
           revalidate: vi.fn().mockResolvedValue(undefined),
         }}

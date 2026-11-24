@@ -166,6 +166,24 @@ describe('authRuntime', () => {
     expect(window.sessionStorage.getItem(SIGNOUT_REASON_KEY)).toBeNull();
   });
 
+  it('getSession rejects (unknown, not signed out) on a transient refresh failure (R4)', async () => {
+    mocks.getSession.mockResolvedValue({
+      data: { session: null },
+      error: new AuthRetryableFetchError('Failed to fetch', 0),
+    });
+    await expect(defaultAuthDeps.getSession()).rejects.toThrow('Session unavailable');
+  });
+
+  it('getSession resolves null when the session is definitively gone', async () => {
+    mocks.getSession.mockResolvedValue({
+      data: { session: null },
+      error: new AuthApiError('Invalid Refresh Token', 400, 'refresh_token_not_found'),
+    });
+    await expect(defaultAuthDeps.getSession()).resolves.toBeNull();
+    mocks.getSession.mockResolvedValue({ data: { session: null }, error: null });
+    await expect(defaultAuthDeps.getSession()).resolves.toBeNull();
+  });
+
   it('wires the auth subscription and its unsubscribe', () => {
     const callback = vi.fn();
     const unsubscribe = defaultAuthDeps.onAuthStateChange(callback);

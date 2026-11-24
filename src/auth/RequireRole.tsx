@@ -15,7 +15,7 @@ import { useAuth } from './AuthProvider';
  * show the last panel view from cache.
  */
 export function RequireRole({ allow, children }: { allow: WebRole[]; children: ReactNode }) {
-  const { status, role, revalidate } = useAuth();
+  const { status, role, revalidate, connectionProblem } = useAuth();
 
   useEffect(() => {
     function handlePageShow(event: PageTransitionEvent) {
@@ -27,7 +27,13 @@ export function RequireRole({ allow, children }: { allow: WebRole[]; children: R
     return () => window.removeEventListener('pageshow', handlePageShow);
   }, [revalidate]);
 
-  if (status === 'loading') return <p>Yükleniyor…</p>;
+  if (status === 'loading') {
+    return connectionProblem ? (
+      <p role="status">Sunucuya ulaşılamıyor. Yeniden deneniyor…</p>
+    ) : (
+      <p>Yükleniyor…</p>
+    );
+  }
   if (status === 'signedOut') return <Navigate to="/login" replace />;
   if (!isWebRole(role) || !allow.includes(role)) return <Navigate to="/login" replace />;
   return <>{children}</>;

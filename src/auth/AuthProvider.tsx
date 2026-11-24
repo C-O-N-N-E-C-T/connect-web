@@ -31,6 +31,11 @@ export interface AuthState {
   session: Session | null;
   /** Server role from GET /auth/me when known, otherwise the JWT `user_role` claim. */
   role: AppRole | null;
+  /**
+   * True while the stored session cannot be read because Supabase is unreachable (review R4). The
+   * status then stays `loading` (no panel, no /login) and the read is retried.
+   */
+  connectionProblem: boolean;
 }
 
 export interface AuthContextValue extends AuthState {
@@ -48,6 +53,11 @@ export interface AuthMeBody {
 
 /** Injected so the provider can be tested without Supabase or the network. */
 export interface AuthProviderDeps {
+  /**
+   * The stored session, refreshed if needed; null = signed out. REJECTS when it cannot be
+   * determined for a transient reason (offline / 5xx while refreshing an expiring token): that is
+   * not "signed out" (review R4).
+   */
   getSession(): Promise<Session | null>;
   /** Subscribes; returns the unsubscribe function. */
   onAuthStateChange(callback: (event: AuthChangeEvent, session: Session | null) => void): () => void;
@@ -107,8 +117,11 @@ export function sessionKeyOf(session: Session): string | null {
   return readSessionKey(session.access_token) ?? userIdOf(session);
 }
 
-const LOADING: AuthState = { status: 'loading', session: null, role: null };
-const SIGNED_OUT: AuthState = { status: 'signedOut', session: null, role: null };
+const LOADING: AuthState = { status: 'loading', session: null, role: null, connectionProblem: false };
+const SIGNED_OUT: AuthState = { status: 'signedOut', session: null, role: null, connectionProblem: false };
+
+/** Retry delays for reading the session while Supabase is unreachable (R4); the last one repeats. */
+export const SESSION_RETRY_DELAYS_MS = [2_000, 5_000, 10_000, 30_000];
 
 /**
  * Holds the Supabase session and the user's role for the whole app (OSP-70).
@@ -152,7 +165,7 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
     const userId = userIdOf(session);
     const server = serverRoleRef.current;
     const role = server && server.userId === userId ? server.role : jwtRole(session);
-    setState({ status: 'signedIn', session, role });
+    setState({ status: 'signedIn', session, role, connectionProblem: false });
   }, []);
 
   /**
@@ -245,11 +258,17 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
     const d = depsRef.current;
     let active = true;
 
-    const unsubscribe = d.onAuthStateChange((_event, session) => {
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let retries = 0;
+
+    const unsubscribe = d.onAuthStateChange((event, session) => {
       // Synchronous state updates only. Never await a Supabase call inside this callback
       // (known supabase-js deadlock). If async work is ever needed here, defer it with
       // setTimeout(..., 0).
       if (!active) return;
+      // The startup getSession() decides the initial state: a null INITIAL_SESSION is also what
+      // supabase-js reports when it could not refresh an expiring token offline (R4).
+      if (event === 'INITIAL_SESSION' && !session) return;
       if (!session) {
         applySession(null);
         return;
@@ -276,20 +295,34 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
       // Status stays "loading" until it is done, so no protected UI is rendered.
       void runLogout(STARTUP_LOGOUT_TIMEOUT_MS, pendingLogoutKey(d.storage()));
     } else {
-      void d.getSession().then(
-        (session) => {
-          if (!active || (session && isLogoutPending(d.storage(), sessionKeyOf(session)))) return;
-          applySession(session);
-          if (session) void checkMe();
-        },
-        () => {
-          if (active) applySession(null);
-        },
-      );
+      const load = () => {
+        void d.getSession().then(
+          (session) => {
+            if (!active || (session && isLogoutPending(d.storage(), sessionKeyOf(session)))) return;
+            applySession(session);
+            // R12: not on /login, where a sign-in may be in progress.
+            if (session && pathnameRef.current !== '/login') void checkMe();
+          },
+          () => {
+            // R4: the session could not be read for a transient reason. It is still stored, so
+            // this is NOT "signed out": stay loading and try again. A TOKEN_REFRESHED / SIGNED_IN
+            // event from supabase-js (network back) ends this state too.
+            if (!active || sessionRef.current) return;
+            setState((prev) => (prev.status === 'loading' ? { ...prev, connectionProblem: true } : prev));
+            const delay = SESSION_RETRY_DELAYS_MS[Math.min(retries, SESSION_RETRY_DELAYS_MS.length - 1)];
+            retries += 1;
+            retryTimer = setTimeout(() => {
+              if (active && !sessionRef.current) load();
+            }, delay);
+          },
+        );
+      };
+      load();
     }
 
     return () => {
       active = false;
+      clearTimeout(retryTimer);
       unsubscribe();
     };
   }, [applySession, checkMe, runLogout]);
@@ -332,7 +365,7 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
     try {
       session = await d.getSession();
     } catch {
-      session = null;
+      return; // R4: unknown (transient) is not "signed out": keep the current state
     }
     if (session && isLogoutPending(d.storage(), sessionKeyOf(session))) return;
     applySession(session);

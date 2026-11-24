@@ -106,6 +106,69 @@ describe('AuthProvider: session bootstrap', () => {
   });
 });
 
+describe('AuthProvider: Supabase unreachable at startup (R4)', () => {
+  it('stays loading (not /login) and retries until the stored session can be read', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { deps, emit } = makeAuthDeps({ mode: 'mock' });
+      deps.getSession
+        .mockRejectedValueOnce(new Error('offline'))
+        .mockRejectedValueOnce(new Error('offline'))
+        .mockResolvedValue(sessionFor('coordinator'));
+      renderApp(deps);
+
+      // supabase-js reports the unreadable session as a null INITIAL_SESSION: ignored.
+      act(() => emit('INITIAL_SESSION', null));
+      expect(await screen.findByText('Sunucuya ulaşılamıyor. Yeniden deneniyor…')).toBeInTheDocument();
+      expect(screen.queryByText('LOGIN SCREEN')).not.toBeInTheDocument();
+      expect(probe()).toBe('loading|-|/dashboard');
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2_000);
+      });
+      expect(deps.getSession).toHaveBeenCalledTimes(2);
+      expect(probe()).toBe('loading|-|/dashboard');
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(await screen.findByText('PANEL CONTENT')).toBeInTheDocument();
+      expect(deps.getSession).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a TOKEN_REFRESHED event (network back) ends the waiting state', async () => {
+    const { deps, emit } = makeAuthDeps({ mode: 'mock' });
+    deps.getSession.mockRejectedValue(new Error('offline'));
+    renderApp(deps);
+    expect(await screen.findByText('Sunucuya ulaşılamıyor. Yeniden deneniyor…')).toBeInTheDocument();
+
+    act(() => emit('TOKEN_REFRESHED', sessionFor('coordinator')));
+    expect(await screen.findByText('PANEL CONTENT')).toBeInTheDocument();
+  });
+
+  it('a transient failure during the back/forward-cache re-check keeps the user signed in', async () => {
+    const { deps } = makeAuthDeps({ mode: 'mock' });
+    deps.getSession.mockResolvedValueOnce(sessionFor('coordinator')).mockRejectedValueOnce(new Error('offline'));
+    renderApp(deps);
+    expect(await screen.findByText('PANEL CONTENT')).toBeInTheDocument();
+    await act(async () => {
+      await renderedAuth().revalidate();
+    });
+    expect(screen.getByText('PANEL CONTENT')).toBeInTheDocument();
+  });
+
+  it('a null INITIAL_SESSION does not hide a session that getSession() returns', async () => {
+    const { deps, emit } = makeAuthDeps({ mode: 'mock' });
+    deps.getSession.mockResolvedValue(sessionFor('coordinator'));
+    renderApp(deps);
+    act(() => emit('INITIAL_SESSION', null));
+    expect(await screen.findByText('PANEL CONTENT')).toBeInTheDocument();
+  });
+});
+
 describe('AuthProvider: GET /auth/me', () => {
   it('calls /auth/me once at startup when a session exists', async () => {
     const { deps } = makeAuthDeps();
@@ -250,6 +313,14 @@ describe('AuthProvider: GET /auth/me', () => {
     act(() => setVisibility('visible'));
     act(() => setVisibility('visible'));
     expect(deps.fetchMe).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not check at startup on the login page either (R12)', async () => {
+    const { deps } = makeAuthDeps();
+    deps.getSession.mockResolvedValue(sessionFor('coordinator'));
+    renderApp(deps, '/login');
+    await waitFor(() => expect(probe()).toBe('signedIn|coordinator|/login'));
+    expect(deps.fetchMe).not.toHaveBeenCalled();
   });
 
   it('does not check on the login page (a sign-in may be in progress)', async () => {

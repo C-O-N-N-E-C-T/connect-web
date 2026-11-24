@@ -21,6 +21,14 @@ import { isLogoutPending, SIGN_OUT_TIMEOUT_MS } from './logout';
 import { classifyRefresh } from './refreshResult';
 import type { AuthProviderDeps } from './AuthProvider';
 
+/** getSession() could not determine the session for a transient reason (R4). */
+export class SessionUnavailableError extends Error {
+  constructor(readonly kind: string) {
+    super(`Session unavailable (${kind})`);
+    this.name = 'SessionUnavailableError';
+  }
+}
+
 type AuthListener = (event: AuthChangeEvent, session: Session | null) => void;
 const localSignOutListeners = new Set<AuthListener>();
 
@@ -115,8 +123,12 @@ export const defaultAuthDeps: AuthProviderDeps = {
   markSessionEnded,
   storedSessionKey: () => storedSessionKey(safeLocalStorage()),
   getSession: async () => {
-    const { data } = await supabase.auth.getSession();
-    return data.session;
+    const result = await supabase.auth.getSession();
+    if (result.data.session) return result.data.session;
+    const classified = classifyRefresh(result);
+    // R4: a transient failure while refreshing the stored token is "unknown", not "signed out".
+    if (!classified.ok && !classified.definitive) throw new SessionUnavailableError(classified.kind);
+    return null;
   },
   onAuthStateChange: (callback) => {
     const { data } = supabase.auth.onAuthStateChange(callback);
