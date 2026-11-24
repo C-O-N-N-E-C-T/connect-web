@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { resetEndedSessions } from './endedSessions';
+import { clearSessionEnded, resetEndedSessions } from './endedSessions';
+import { tokenFor } from '../test/authTestUtils';
 import {
   clearSignOutReason,
   createForcedSignOut,
@@ -85,6 +86,26 @@ describe('createForcedSignOut', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('signs out a second sign-in of the same user (new session_id) on DEVICE_REVOKED', async () => {
+    const { deps } = makeDeps();
+    const force = createForcedSignOut(deps);
+    await force('DEVICE_REVOKED', tokenFor({ sub: 'u-1', session_id: 's-1' }));
+    await force('DEVICE_REVOKED', tokenFor({ sub: 'u-1', session_id: 's-2' }));
+    expect(deps.signOut).toHaveBeenCalledTimes(2);
+  });
+
+  it('without session_id (sub fallback) a re-login is live again once the provider clears the mark', async () => {
+    const { deps } = makeDeps();
+    const force = createForcedSignOut(deps);
+    await force('DEVICE_REVOKED', tokenFor({ sub: 'u-1', iat: 1 }));
+    await force('SESSION_EXPIRED', tokenFor({ sub: 'u-1', iat: 2 })); // late answer: ignored
+    expect(deps.signOut).toHaveBeenCalledOnce();
+
+    clearSessionEnded('u-1'); // AuthProvider: SIGNED_IN from the signed-out state
+    await force('DEVICE_REVOKED', tokenFor({ sub: 'u-1', iat: 3 }));
+    expect(deps.signOut).toHaveBeenCalledTimes(2);
   });
 
   it('notifies reason subscribers', async () => {

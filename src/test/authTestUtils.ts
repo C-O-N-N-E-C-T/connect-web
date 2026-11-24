@@ -52,6 +52,7 @@ export function makeAuthDeps(overrides: Partial<AuthProviderDeps> = {}) {
     }),
     forceSignOut: vi.fn<AuthProviderDeps['forceSignOut']>().mockResolvedValue(undefined),
     markSessionEnded: vi.fn<AuthProviderDeps['markSessionEnded']>(),
+    clearSessionEnded: vi.fn<AuthProviderDeps['clearSessionEnded']>(),
     storedSessionKey: vi.fn<AuthProviderDeps['storedSessionKey']>(() => null),
     setLoginNavigator: vi.fn<AuthProviderDeps['setLoginNavigator']>(() => () => undefined),
     storage: () => window.localStorage,

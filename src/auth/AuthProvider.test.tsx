@@ -94,6 +94,17 @@ describe('AuthProvider: session bootstrap', () => {
     expect(probe()).toBe('signedOut|-|/login');
   });
 
+  it('a sign-in from the signed-out state clears an old ended mark; a token refresh does not', async () => {
+    const { deps, emit } = makeAuthDeps({ mode: 'mock' });
+    renderApp(deps, '/login');
+    await waitFor(() => expect(probe()).toBe('signedOut|-|/login'));
+    act(() => emit('SIGNED_IN', sessionFor('coordinator')));
+    expect(deps.clearSessionEnded).toHaveBeenCalledWith('sess-user-1');
+    act(() => emit('TOKEN_REFRESHED', sessionFor('coordinator', 'user-1', 'r2')));
+    act(() => emit('SIGNED_IN', sessionFor('coordinator', 'user-1', 'refocus')));
+    expect(deps.clearSessionEnded).toHaveBeenCalledOnce();
+  });
+
   it('registers a login navigator that navigates to /login', async () => {
     const { deps } = makeAuthDeps({ mode: 'mock' });
     deps.getSession.mockResolvedValue(sessionFor('coordinator'));

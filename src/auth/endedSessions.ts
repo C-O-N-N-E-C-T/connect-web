@@ -12,6 +12,16 @@ export function markSessionEnded(sessionKey: string | null): void {
   if (ended.length > MAX) ended.shift();
 }
 
+/**
+ * A fresh sign-in with an identity that was ended before (only possible when tokens carry no
+ * `session_id` and the identity falls back to `sub`): it is a live session again.
+ */
+export function clearSessionEnded(sessionKey: string | null): void {
+  if (!sessionKey) return;
+  const index = ended.indexOf(sessionKey);
+  if (index !== -1) ended.splice(index, 1);
+}
+
 export function isSessionEnded(sessionKey: string): boolean {
   return ended.includes(sessionKey);
 }

@@ -69,6 +69,8 @@ export interface AuthProviderDeps {
   forceSignOut: ForceSignOut;
   /** Records that this tab ended a session on purpose (see endedSessions.ts). */
   markSessionEnded(sessionKey: string | null): void;
+  /** A fresh sign-in makes that identity live again (see endedSessions.ts). */
+  clearSessionEnded(sessionKey: string | null): void;
   /** Identity of the session persisted by supabase-js, read without any network call. */
   storedSessionKey(): string | null;
   setLoginNavigator(navigateToLogin: () => void): () => void;
@@ -281,6 +283,9 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
         // later reload does not log the new session out.
         clearLogoutPending(d.storage());
       }
+      // A real sign-in from the signed-out state (not a token refresh of a session being signed
+      // out) is a live session, even if its identity was ended before (sub fallback, R2).
+      if (event === 'SIGNED_IN' && !sessionRef.current) d.clearSessionEnded(sessionKeyOf(session));
       applySession(session);
     });
 

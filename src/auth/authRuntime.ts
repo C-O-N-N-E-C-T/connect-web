@@ -16,7 +16,7 @@ import { createApiClient } from '../services/apiClient';
 import { registerBrowserSession } from '../services/authSessionClient';
 import { getOrCreateDeviceId } from '../services/deviceId';
 import { createForcedSignOut } from './forcedSignOut';
-import { isSessionEnded, markSessionEnded } from './endedSessions';
+import { clearSessionEnded, isSessionEnded, markSessionEnded } from './endedSessions';
 import { isLogoutPending, SIGN_OUT_TIMEOUT_MS } from './logout';
 import { classifyRefresh } from './refreshResult';
 import type { AuthProviderDeps } from './AuthProvider';
@@ -121,6 +121,7 @@ export interface AuthMeResponse {
 
 export const defaultAuthDeps: AuthProviderDeps = {
   markSessionEnded,
+  clearSessionEnded,
   storedSessionKey: () => storedSessionKey(safeLocalStorage()),
   getSession: async () => {
     const result = await supabase.auth.getSession();
