@@ -4,7 +4,7 @@ import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { validateLoginForm, LoginPage } from './LoginPage';
-import { createForcedSignOut, SIGNOUT_REASON_KEY } from '../auth/forcedSignOut';
+import { createForcedSignOut, SIGNOUT_REASON_KEY, storeSignOutReason } from '../auth/forcedSignOut';
 import { blockStorage, restoreStorage } from '../test/blockStorage';
 
 const mocks = vi.hoisted(() => ({
@@ -170,6 +170,22 @@ describe('LoginPage: forced sign-out reason (OSP-70)', () => {
           <LoginPage />
         </MemoryRouter>
       </StrictMode>,
+    );
+    expect(screen.getByRole('alert')).toHaveTextContent('Bu cihazın erişimi iptal edildi.');
+    expect(window.sessionStorage.getItem(SIGNOUT_REASON_KEY)).toBeNull();
+  });
+
+  it('shows a reason stored between the first render and the effect (R14)', () => {
+    // Stores a reason during its own render, i.e. after LoginPage's initializer already peeked.
+    function StoresReasonWhileRendering() {
+      storeSignOutReason(window.sessionStorage, 'DEVICE_REVOKED');
+      return null;
+    }
+    render(
+      <MemoryRouter>
+        <LoginPage />
+        <StoresReasonWhileRendering />
+      </MemoryRouter>,
     );
     expect(screen.getByRole('alert')).toHaveTextContent('Bu cihazın erişimi iptal edildi.');
     expect(window.sessionStorage.getItem(SIGNOUT_REASON_KEY)).toBeNull();

@@ -38,12 +38,19 @@ export function LoginPage() {
   const [showPassword, setShowPassword] = useState(false);
 
   useEffect(() => {
-    clearSignOutReason(safeSessionStorage());
-    // A forced sign-out while this page is already mounted (e.g. the SDK dropped the session first).
-    return subscribeSignOutReason((reason) => {
+    // Subscribe FIRST, then re-read: a reason stored between the initial render and this effect
+    // is not lost (review R14). Only a non-null re-read sets the banner, so StrictMode's second
+    // run (after the first one cleared it) keeps the banner.
+    // A forced sign-out while this page is already mounted (e.g. the SDK dropped the session first)
+    // arrives through the subscription.
+    const unsubscribe = subscribeSignOutReason((reason) => {
       setBannerError(reason);
       clearSignOutReason(safeSessionStorage());
     });
+    const pending = peekSignOutReason(safeSessionStorage());
+    if (pending) setBannerError(pending);
+    clearSignOutReason(safeSessionStorage());
+    return unsubscribe;
   }, []);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
