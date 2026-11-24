@@ -61,7 +61,7 @@ describe.each([
     const client = createApiClient({
       baseUrl: 'http://api.test',
       fetchImpl,
-      getAccessToken: async () => session.access_token,
+      getAccessToken: async () => ({ ok: true, accessToken: session.access_token }),
       refreshAccessToken: vi.fn(),
       rebindSession: vi.fn(),
       forceSignOut,

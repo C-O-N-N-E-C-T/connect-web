@@ -95,11 +95,19 @@ export type RefreshResult =
   | { ok: false; definitive: true }
   | { ok: false; definitive: false; kind: TransientKind; status?: number };
 
+/**
+ * Current access token. `accessToken: null` = signed out. `ok: false` = the session could not be
+ * read for a transient reason (e.g. supabase-js had to refresh an expiring token while offline);
+ * that is NOT "signed out" (review R10).
+ */
+export type TokenLookup =
+  | { ok: true; accessToken: string | null }
+  | { ok: false; kind: TransientKind; status?: number };
+
 export interface ApiClientDeps {
   baseUrl: string;
   fetchImpl: FetchLike;
-  /** Current access token from the Supabase session, or null when signed out. */
-  getAccessToken(): Promise<string | null>;
+  getAccessToken(): Promise<TokenLookup>;
   /** Refreshes the Supabase session and classifies a failure (see RefreshResult). */
   refreshAccessToken(): Promise<RefreshResult>;
   /** POST /api/v1/auth/session for this browser (existing OSP-60 client). */
@@ -134,7 +142,10 @@ export function createApiClient(deps: ApiClientDeps): ApiClient {
     if (!refreshInFlight) {
       refreshInFlight = deps
         .refreshAccessToken()
-        .catch(() => TRANSIENT_NETWORK)
+        .catch((error: unknown) => {
+          reportUnexpected('refreshAccessToken', error);
+          return TRANSIENT_NETWORK;
+        })
         .finally(() => {
           refreshInFlight = null;
         });
@@ -147,15 +158,21 @@ export function createApiClient(deps: ApiClientDeps): ApiClient {
    * already refreshed the session; use it instead of refreshing again.
    */
   async function freshTokenAfter401(usedToken: string): Promise<RefreshResult> {
-    const current = await deps.getAccessToken().catch(() => null);
+    const current = await currentToken();
     if (current && current !== usedToken) return { ok: true, accessToken: current };
     return refreshOnce();
+  }
+
+  /** Current token, or null when signed out or unreadable. */
+  async function currentToken(): Promise<string | null> {
+    const lookup = await deps.getAccessToken().catch(() => null);
+    return lookup && lookup.ok ? lookup.accessToken : null;
   }
 
   function rebindOnce(): Promise<RebindOutcome> {
     if (!rebindInFlight) {
       rebindInFlight = (async (): Promise<RebindOutcome> => {
-        const token = await deps.getAccessToken().catch(() => null);
+        const token = await currentToken();
         if (!token) return { ok: false, signOut: 'SESSION_EXPIRED' }; // no session to bind
         let result: RegisterSessionResult;
         try {
@@ -216,8 +233,9 @@ export function createApiClient(deps: ApiClientDeps): ApiClient {
 
   async function request<T>(path: string, options: ApiRequestOptions = {}): Promise<ApiResult<T>> {
     // Only relative API paths: the bearer token must never be sent to another origin.
-    if (!path.startsWith('/') || path.startsWith('//')) {
-      throw new Error(`apiClient: path must start with a single "/": ${path}`);
+    // A backslash is rejected too: URL parsing treats "/\\host" like "//host" (review R15).
+    if (!path.startsWith('/') || path.startsWith('//') || path.includes('\\')) {
+      throw new Error(`apiClient: path must start with a single "/" and contain no "\\": ${path}`);
     }
     const recoveryAllowed = () => options.recovery !== false && !deps.isLogoutPending();
     // One deadline for the whole request: getSession() / refreshSession() can themselves hang
@@ -226,8 +244,16 @@ export function createApiClient(deps: ApiClientDeps): ApiClient {
     const remaining = () => deadlineAt - Date.now();
     const TIMEOUT: ApiResult<never> = { ok: false, error: { kind: 'TIMEOUT' } };
 
-    const token = await withDeadline(deps.getAccessToken().catch(() => null), remaining());
-    if (token === TIMED_OUT) return TIMEOUT;
+    const lookup = await withDeadline(
+      deps.getAccessToken().catch((error: unknown): TokenLookup => {
+        reportUnexpected('getAccessToken', error);
+        return { ok: false, kind: 'NETWORK_ERROR' };
+      }),
+      remaining(),
+    );
+    if (lookup === TIMED_OUT) return TIMEOUT;
+    if (!lookup.ok) return { ok: false, error: transientError(lookup.kind, lookup.status) };
+    const token = lookup.accessToken;
     if (!token) return { ok: false, error: { kind: 'UNAUTHENTICATED' } };
 
     const first = await send(path, token, options, remaining());
@@ -253,7 +279,7 @@ export function createApiClient(deps: ApiClientDeps): ApiClient {
         // D4a: transient re-bind failure -> typed error, stay signed in, no retry.
         return { ok: false, error: rebind.error };
       }
-      const current = await withDeadline(deps.getAccessToken().catch(() => null), remaining());
+      const current = await withDeadline(currentToken(), remaining());
       if (current === TIMED_OUT) return TIMEOUT;
       retryToken = current ?? token;
     } else {
@@ -275,6 +301,17 @@ export function createApiClient(deps: ApiClientDeps): ApiClient {
   }
 
   return { request };
+}
+
+/**
+ * Dev-only trace of an unexpected exception that is mapped to a typed error (review R16). Only the
+ * error name and status are logged, never messages, tokens or URLs.
+ */
+function reportUnexpected(where: string, error: unknown): void {
+  if (!import.meta.env.DEV) return;
+  const name = error instanceof Error ? error.name : typeof error;
+  const status = (error as { status?: unknown } | null)?.status;
+  console.warn(`[apiClient] ${where} failed unexpectedly`, { name, status });
 }
 
 function transientError(kind: TransientKind, status?: number): ApiError {

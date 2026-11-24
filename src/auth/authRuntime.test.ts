@@ -104,6 +104,17 @@ describe('authRuntime', () => {
     expect(mocks.signOut).not.toHaveBeenCalled();
   });
 
+  it('a transient failure while reading the session is NETWORK_ERROR, not UNAUTHENTICATED (R10)', async () => {
+    mocks.getSession.mockResolvedValue({
+      data: { session: null },
+      error: new AuthRetryableFetchError('Failed to fetch', 0),
+    });
+    const result = await apiClient.request('/api/v1/auth/me');
+    expect(result).toEqual({ ok: false, error: { kind: 'NETWORK_ERROR' } });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(mocks.signOut).not.toHaveBeenCalled();
+  });
+
   it('a network failure during refresh keeps the user signed in (D4a)', async () => {
     mocks.getSession.mockResolvedValue(sessionWith('tok-offline'));
     mocks.refreshSession.mockResolvedValue({

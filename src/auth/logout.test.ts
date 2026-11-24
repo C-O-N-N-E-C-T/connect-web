@@ -65,7 +65,7 @@ describe('performLogout is bounded (R1)', () => {
 describe('logout through the API client', () => {
   function setup(
     fetchImpl: ApiClientDeps['fetchImpl'],
-    getAccessToken: ApiClientDeps['getAccessToken'] = async () => 'tok',
+    getAccessToken: ApiClientDeps['getAccessToken'] = async () => ({ ok: true, accessToken: 'tok' }),
   ) {
     const clientDeps = {
       baseUrl: 'http://api.test',
@@ -142,7 +142,7 @@ describe('logout through the API client', () => {
     vi.useFakeTimers();
     const { clientDeps, signOut, run } = setup(
       async () => new Response(null, { status: 204 }),
-      () => new Promise<string | null>(() => undefined),
+      () => new Promise<never>(() => undefined),
     );
     const done = run();
     await vi.advanceTimersByTimeAsync(4_999);

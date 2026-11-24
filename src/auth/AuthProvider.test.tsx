@@ -171,6 +171,18 @@ describe('AuthProvider: GET /auth/me', () => {
     expect(deps.forceSignOut).not.toHaveBeenCalled();
   });
 
+  it('swallows an unexpected exception from /auth/me (no unhandled rejection, R16)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const { deps } = makeAuthDeps();
+    deps.getSession.mockResolvedValue(sessionFor('coordinator'));
+    deps.fetchMe.mockRejectedValue(new Error('boom'));
+    renderApp(deps);
+    await waitFor(() => expect(deps.fetchMe).toHaveBeenCalled());
+    await waitFor(() => expect(warn).toHaveBeenCalled());
+    expect(screen.getByText('PANEL CONTENT')).toBeInTheDocument();
+    warn.mockRestore();
+  });
+
   it('re-checks when the tab becomes visible, at most once per 10 s', async () => {
     const { deps, advance } = makeAuthDeps();
     deps.getSession.mockResolvedValue(sessionFor('coordinator'));

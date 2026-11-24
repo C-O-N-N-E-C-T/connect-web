@@ -86,9 +86,12 @@ export const forceSignOut = createForcedSignOut({
 export const apiClient = createApiClient({
   baseUrl: import.meta.env.VITE_API_BASE_URL ?? '',
   fetchImpl: (input, init) => fetch(input, init),
+  // getSession() refreshes an expiring token; a transient failure there is not "signed out" (R10).
   getAccessToken: async () => {
-    const { data } = await supabase.auth.getSession();
-    return data.session?.access_token ?? null;
+    const result = classifyRefresh(await supabase.auth.getSession());
+    if (result.ok) return { ok: true, accessToken: result.accessToken };
+    if (result.definitive) return { ok: true, accessToken: null };
+    return { ok: false, kind: result.kind, ...(result.status !== undefined ? { status: result.status } : {}) };
   },
   refreshAccessToken: async () => classifyRefresh(await supabase.auth.refreshSession()),
   rebindSession: (accessToken) =>

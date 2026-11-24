@@ -18,7 +18,7 @@ function makeDeps(overrides: Partial<ApiClientDeps> = {}) {
   const deps = {
     baseUrl: BASE,
     fetchImpl: vi.fn<ApiClientDeps['fetchImpl']>(),
-    getAccessToken: vi.fn(async () => current),
+    getAccessToken: vi.fn<ApiClientDeps['getAccessToken']>(async () => ({ ok: true, accessToken: current })),
     refreshAccessToken: vi.fn<ApiClientDeps['refreshAccessToken']>(async () => {
       current = 'tok-2';
       return { ok: true, accessToken: current };
@@ -86,7 +86,7 @@ describe('apiClient: basics', () => {
     expect(result).toEqual({ ok: false, error: { kind: 'INVALID_RESPONSE', status: 200 } });
   });
 
-  it.each(['https://evil.test/api', '//evil.test/api', 'api/v1/x'])(
+  it.each(['https://evil.test/api', '//evil.test/api', 'api/v1/x', '/\\evil.test/api', '/api\\x'])(
     'refuses a path that is not a relative API path (%s)',
     async (path) => {
       const { deps } = makeDeps();
@@ -102,6 +102,33 @@ describe('apiClient: basics', () => {
     expect(result).toEqual({ ok: false, error: { kind: 'UNAUTHENTICATED' } });
     expect(deps.fetchImpl).not.toHaveBeenCalled();
     expect(deps.forceSignOut).not.toHaveBeenCalled();
+  });
+});
+
+describe('apiClient: session lookup failures (R10, R16)', () => {
+  it.each([
+    [{ ok: false, kind: 'NETWORK_ERROR' } as const, { kind: 'NETWORK_ERROR' }],
+    [{ ok: false, kind: 'SERVER_ERROR', status: 503 } as const, { kind: 'SERVER_ERROR', status: 503 }],
+    [{ ok: false, kind: 'RATE_LIMITED', status: 429 } as const, { kind: 'RATE_LIMITED', status: 429 }],
+  ])('maps a transient lookup failure to a typed error, not UNAUTHENTICATED', async (lookup, expected) => {
+    const { deps } = makeDeps();
+    deps.getAccessToken.mockResolvedValueOnce(lookup);
+    expect(await createApiClient(deps).request('/api/v1/x')).toEqual({ ok: false, error: expected });
+    expect(deps.fetchImpl).not.toHaveBeenCalled();
+    expect(deps.forceSignOut).not.toHaveBeenCalled();
+  });
+
+  it('maps a throwing lookup to NETWORK_ERROR and logs only the error name', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const { deps } = makeDeps();
+    deps.getAccessToken.mockRejectedValueOnce(new TypeError('secret-token-in-message'));
+    expect(await createApiClient(deps).request('/api/v1/x')).toEqual({
+      ok: false,
+      error: { kind: 'NETWORK_ERROR' },
+    });
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('secret-token-in-message');
+    expect(JSON.stringify(warn.mock.calls)).toContain('TypeError');
+    warn.mockRestore();
   });
 });
 
@@ -510,7 +537,8 @@ describe('apiClient: errors that never sign out', () => {
 describe('apiClient: one deadline for the whole request', () => {
   it('times out when getting the token hangs (no request is sent)', async () => {
     vi.useFakeTimers();
-    const { deps } = makeDeps({ getAccessToken: vi.fn(() => new Promise<string | null>(() => undefined)) });
+    const { deps } = makeDeps();
+    deps.getAccessToken.mockImplementation(() => new Promise(() => undefined));
     const pending = createApiClient(deps).request('/api/v1/x', { timeoutMs: 5000 });
     await vi.advanceTimersByTimeAsync(5000);
     expect(await pending).toEqual({ ok: false, error: { kind: 'TIMEOUT' } });

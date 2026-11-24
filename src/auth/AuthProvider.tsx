@@ -161,7 +161,18 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
     lastMeStartRef.current = d.now();
 
     const run = (async () => {
-      const result = await d.fetchMe();
+      let result: Awaited<ReturnType<AuthProviderDeps['fetchMe']>>;
+      try {
+        result = await d.fetchMe();
+      } catch (error) {
+        // Never an unhandled rejection from a fire-and-forget check (review R16).
+        if (import.meta.env.DEV) {
+          console.warn('[AuthProvider] /auth/me check failed unexpectedly', {
+            name: error instanceof Error ? error.name : typeof error,
+          });
+        }
+        return;
+      }
       if (!result.ok) return;
       const body = result.data;
       if (!body || typeof body.role !== 'string' || typeof body.user_id !== 'string') return;
