@@ -7,16 +7,8 @@ import { createApiClient } from '../services/apiClient';
 import { registerBrowserSession } from '../services/authSessionClient';
 import { getOrCreateDeviceId } from '../services/deviceId';
 import { createForcedSignOut } from './forcedSignOut';
-
-export const LOGOUT_PENDING_KEY = 'connect.logout_pending';
-
-export function isLogoutPending(storage: Storage = window.localStorage): boolean {
-  try {
-    return storage.getItem(LOGOUT_PENDING_KEY) !== null;
-  } catch {
-    return false;
-  }
-}
+import { isLogoutPending } from './logout';
+import type { AuthProviderDeps } from './AuthProvider';
 
 /**
  * Every sign-out in the web app uses `scope: 'local'` (design D2): with the default `global`
@@ -68,3 +60,30 @@ export const apiClient = createApiClient({
   forceSignOut,
   isLogoutPending: () => isLogoutPending(),
 });
+
+/** GET /api/v1/auth/me response (contract in design D3 / connect-backend docs). */
+export interface AuthMeResponse {
+  user_id: string;
+  role: string;
+  device_id: string;
+}
+
+export const defaultAuthDeps: AuthProviderDeps = {
+  getSession: async () => {
+    const { data } = await supabase.auth.getSession();
+    return data.session;
+  },
+  onAuthStateChange: (callback) => {
+    const { data } = supabase.auth.onAuthStateChange(callback);
+    return () => data.subscription.unsubscribe();
+  },
+  fetchMe: () => apiClient.request<AuthMeResponse>('/api/v1/auth/me'),
+  callLogoutEndpoint: (timeoutMs) =>
+    apiClient.request('/api/v1/auth/logout', { method: 'POST', timeoutMs, recovery: false }),
+  signOut: signOutLocal,
+  forceSignOut,
+  setLoginNavigator,
+  storage: () => window.localStorage,
+  mode: import.meta.env.VITE_AUTH_SESSION_MODE,
+  now: () => Date.now(),
+};
