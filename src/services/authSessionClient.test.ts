@@ -32,19 +32,19 @@ describe('registerBrowserSession', () => {
   it('maps ACCOUNT_DISABLED from the error body', async () => {
     const fetchImpl = vi.fn().mockResolvedValue(jsonResponse(403, { error_code: 'ACCOUNT_DISABLED', message: 'x' }));
     const result = await registerBrowserSession(input, 'tok', { mode: 'real', fetchImpl });
-    expect(result).toEqual({ ok: false, code: 'ACCOUNT_DISABLED' });
+    expect(result).toEqual({ ok: false, code: 'ACCOUNT_DISABLED', status: 403 });
   });
 
   it('maps DEVICE_REVOKED from the error body', async () => {
     const fetchImpl = vi.fn().mockResolvedValue(jsonResponse(403, { error_code: 'DEVICE_REVOKED', message: 'x' }));
     const result = await registerBrowserSession(input, 'tok', { mode: 'real', fetchImpl });
-    expect(result).toEqual({ ok: false, code: 'DEVICE_REVOKED' });
+    expect(result).toEqual({ ok: false, code: 'DEVICE_REVOKED', status: 403 });
   });
 
   it('maps HTTP 429 to RATE_LIMITED', async () => {
     const fetchImpl = vi.fn().mockResolvedValue(jsonResponse(429, { error_code: 'RATE_LIMITED', message: 'x' }));
     const result = await registerBrowserSession(input, 'tok', { mode: 'real', fetchImpl });
-    expect(result).toEqual({ ok: false, code: 'RATE_LIMITED' });
+    expect(result).toEqual({ ok: false, code: 'RATE_LIMITED', status: 429 });
   });
 
   it('maps network failures to NETWORK_ERROR', async () => {
@@ -56,6 +56,12 @@ describe('registerBrowserSession', () => {
   it('maps unknown error bodies to UNKNOWN', async () => {
     const fetchImpl = vi.fn().mockResolvedValue(new Response('oops', { status: 500 }));
     const result = await registerBrowserSession(input, 'tok', { mode: 'real', fetchImpl });
-    expect(result).toEqual({ ok: false, code: 'UNKNOWN' });
+    expect(result).toEqual({ ok: false, code: 'UNKNOWN', status: 500 });
+  });
+
+  it('reports the HTTP status of a 401 (re-bind needs it to tell an expired session apart)', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse(401, { error_code: 'UNAUTHENTICATED', message: 'x' }));
+    const result = await registerBrowserSession(input, 'tok', { mode: 'real', fetchImpl });
+    expect(result).toEqual({ ok: false, code: 'UNKNOWN', status: 401 });
   });
 });

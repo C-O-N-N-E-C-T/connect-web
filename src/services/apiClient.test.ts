@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createApiClient, type ApiClientDeps } from './apiClient';
+import { createApiClient, type ApiClientDeps, type RefreshResult } from './apiClient';
 
 const BASE = 'http://api.test';
 
@@ -19,9 +19,9 @@ function makeDeps(overrides: Partial<ApiClientDeps> = {}) {
     baseUrl: BASE,
     fetchImpl: vi.fn<ApiClientDeps['fetchImpl']>(),
     getAccessToken: vi.fn(async () => current),
-    refreshAccessToken: vi.fn(async () => {
+    refreshAccessToken: vi.fn<ApiClientDeps['refreshAccessToken']>(async () => {
       current = 'tok-2';
-      return current;
+      return { ok: true, accessToken: current };
     }),
     rebindSession: vi.fn<ApiClientDeps['rebindSession']>().mockResolvedValue({ ok: true }),
     forceSignOut: vi.fn<ApiClientDeps['forceSignOut']>().mockResolvedValue(undefined),
@@ -121,8 +121,9 @@ describe('apiClient: 401 UNAUTHENTICATED', () => {
     expect(deps.forceSignOut).not.toHaveBeenCalled();
   });
 
-  it('forces sign-out with SESSION_EXPIRED when the refresh fails', async () => {
-    const { deps } = makeDeps({ refreshAccessToken: vi.fn().mockResolvedValue(null) });
+  it('forces sign-out with SESSION_EXPIRED when the refresh is definitively rejected', async () => {
+    const { deps } = makeDeps();
+    deps.refreshAccessToken.mockResolvedValue({ ok: false, definitive: true });
     deps.fetchImpl.mockImplementation(async () => errorResponse(401, 'UNAUTHENTICATED'));
 
     const result = await createApiClient(deps).request('/api/v1/x');
@@ -135,12 +136,66 @@ describe('apiClient: 401 UNAUTHENTICATED', () => {
     expect(deps.fetchImpl).toHaveBeenCalledOnce();
   });
 
-  it('treats a throwing refresh as a failed refresh', async () => {
-    const { deps } = makeDeps({ refreshAccessToken: vi.fn().mockRejectedValue(new Error('boom')) });
-    deps.fetchImpl.mockImplementation(async () => errorResponse(401, 'UNAUTHENTICATED'));
-    const result = await createApiClient(deps).request('/api/v1/x');
-    expect(result.ok).toBe(false);
-    expect(deps.forceSignOut).toHaveBeenCalledWith('SESSION_EXPIRED', 'tok-1');
+  // D4a: transient refresh failures keep the user signed in; the next request tries again.
+  it.each<[string, RefreshResult | Error, object]>([
+    ['network error', { ok: false, definitive: false, kind: 'NETWORK_ERROR' }, { kind: 'NETWORK_ERROR' }],
+    [
+      '5xx',
+      { ok: false, definitive: false, kind: 'SERVER_ERROR', status: 503 },
+      { kind: 'SERVER_ERROR', status: 503 },
+    ],
+    [
+      '429',
+      { ok: false, definitive: false, kind: 'RATE_LIMITED', status: 429 },
+      { kind: 'RATE_LIMITED', status: 429 },
+    ],
+    ['a thrown error', new Error('lock timeout'), { kind: 'NETWORK_ERROR' }],
+  ])('does not sign out when the refresh fails with %s (D4a)', async (_name, failure, expected) => {
+    const { deps } = makeDeps();
+    if (failure instanceof Error) deps.refreshAccessToken.mockRejectedValueOnce(failure);
+    else deps.refreshAccessToken.mockResolvedValueOnce(failure);
+    deps.fetchImpl.mockImplementation(async (_url, init) => {
+      const auth = (init?.headers as Record<string, string>).Authorization;
+      return auth === 'Bearer tok-2' ? jsonResponse(200, { fine: true }) : errorResponse(401, 'UNAUTHENTICATED');
+    });
+    const client = createApiClient(deps);
+
+    expect(await client.request('/api/v1/x')).toEqual({ ok: false, error: expected });
+    expect(deps.forceSignOut).not.toHaveBeenCalled();
+    expect(deps.fetchImpl).toHaveBeenCalledOnce(); // no retry
+
+    // Connection back: the next request refreshes again and succeeds.
+    expect(await client.request('/api/v1/x')).toEqual({ ok: true, status: 200, data: { fine: true } });
+    expect(deps.refreshAccessToken).toHaveBeenCalledTimes(2);
+    expect(deps.forceSignOut).not.toHaveBeenCalled();
+  });
+
+  it('gives every waiter of a shared refresh that failed transiently the typed error, none signs out', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const { deps } = makeDeps();
+    deps.refreshAccessToken.mockImplementationOnce(async () => {
+      await gate;
+      return { ok: false, definitive: false, kind: 'NETWORK_ERROR' };
+    });
+    deps.fetchImpl.mockImplementation(async (_url, init) => {
+      const auth = (init?.headers as Record<string, string>).Authorization;
+      return auth === 'Bearer tok-2' ? jsonResponse(200, {}) : errorResponse(401, 'UNAUTHENTICATED');
+    });
+    const client = createApiClient(deps);
+
+    const all = Promise.all([client.request('/api/v1/a'), client.request('/api/v1/b'), client.request('/api/v1/c')]);
+    await vi.waitFor(() => expect(deps.refreshAccessToken).toHaveBeenCalled());
+    release();
+    const results = await all;
+
+    expect(results).toEqual(Array(3).fill({ ok: false, error: { kind: 'NETWORK_ERROR' } }));
+    expect(deps.refreshAccessToken).toHaveBeenCalledOnce();
+    expect(deps.forceSignOut).not.toHaveBeenCalled();
+
+    // No cached failure: a later request starts a fresh refresh.
+    expect((await client.request('/api/v1/d')).ok).toBe(true);
+    expect(deps.refreshAccessToken).toHaveBeenCalledTimes(2);
   });
 
   it('forces sign-out when the retry is still 401 (no second refresh)', async () => {
@@ -163,7 +218,7 @@ describe('apiClient: 401 UNAUTHENTICATED', () => {
     deps.refreshAccessToken.mockImplementation(async () => {
       await gate;
       setToken('tok-2');
-      return 'tok-2';
+      return { ok: true, accessToken: 'tok-2' };
     });
     deps.fetchImpl.mockImplementation(async (_url, init) => {
       const auth = (init?.headers as Record<string, string>).Authorization;
@@ -314,17 +369,81 @@ describe('apiClient: 403', () => {
     },
   );
 
-  it.each(['NETWORK_ERROR', 'RATE_LIMITED', 'UNKNOWN'] as const)(
-    'forces sign-out with SESSION_NOT_BOUND when the re-bind fails with %s (D4)',
-    async (code) => {
-      const { deps } = makeDeps();
-      deps.rebindSession.mockResolvedValue({ ok: false, code });
-      deps.fetchImpl.mockImplementation(async () => errorResponse(403, 'SESSION_NOT_BOUND'));
-      const result = await createApiClient(deps).request('/api/v1/x');
-      expect(result).toMatchObject({ ok: false, error: { kind: 'SIGNED_OUT', reason: 'SESSION_NOT_BOUND' } });
-      expect(deps.fetchImpl).toHaveBeenCalledOnce();
-    },
-  );
+  it('forces sign-out with SESSION_EXPIRED when the re-bind answers 401', async () => {
+    const { deps } = makeDeps();
+    deps.rebindSession.mockResolvedValue({ ok: false, code: 'UNKNOWN', status: 401 });
+    deps.fetchImpl.mockImplementation(async () => errorResponse(403, 'SESSION_NOT_BOUND'));
+    const result = await createApiClient(deps).request('/api/v1/x');
+    expect(result).toMatchObject({ ok: false, error: { kind: 'SIGNED_OUT', reason: 'SESSION_EXPIRED' } });
+    expect(deps.forceSignOut).toHaveBeenCalledWith('SESSION_EXPIRED', 'tok-1');
+    expect(deps.fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  // D4a: transient re-bind failures keep the user signed in; the next request re-binds again.
+  it.each<[string, () => Promise<unknown>, object]>([
+    ['network error', async () => ({ ok: false, code: 'NETWORK_ERROR' }), { kind: 'NETWORK_ERROR' }],
+    [
+      '429',
+      async () => ({ ok: false, code: 'RATE_LIMITED', status: 429 }),
+      { kind: 'RATE_LIMITED', status: 429 },
+    ],
+    ['5xx', async () => ({ ok: false, code: 'UNKNOWN', status: 503 }), { kind: 'SERVER_ERROR', status: 503 }],
+    [
+      'UNKNOWN 4xx',
+      async () => ({ ok: false, code: 'UNKNOWN', status: 400 }),
+      { kind: 'HTTP_ERROR', status: 400, errorCode: 'UNKNOWN' },
+    ],
+    ['a thrown error', async () => Promise.reject(new Error('boom')), { kind: 'NETWORK_ERROR' }],
+  ])('does not sign out when the re-bind fails with %s (D4a)', async (_name, rebind, expected) => {
+    let bound = false;
+    const { deps } = makeDeps();
+    deps.rebindSession.mockImplementationOnce(rebind as ApiClientDeps['rebindSession']);
+    deps.rebindSession.mockImplementation(async () => {
+      bound = true;
+      return { ok: true };
+    });
+    deps.fetchImpl.mockImplementation(async () =>
+      bound ? jsonResponse(200, { fine: true }) : errorResponse(403, 'SESSION_NOT_BOUND'),
+    );
+    const client = createApiClient(deps);
+
+    expect(await client.request('/api/v1/x')).toEqual({ ok: false, error: expected });
+    expect(deps.forceSignOut).not.toHaveBeenCalled();
+    expect(deps.fetchImpl).toHaveBeenCalledOnce(); // no retry
+
+    expect(await client.request('/api/v1/x')).toEqual({ ok: true, status: 200, data: { fine: true } });
+    expect(deps.rebindSession).toHaveBeenCalledTimes(2);
+    expect(deps.forceSignOut).not.toHaveBeenCalled();
+  });
+
+  it('gives every waiter of a shared re-bind that failed transiently the typed error, none signs out', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let bound = false;
+    const { deps } = makeDeps();
+    deps.rebindSession.mockImplementationOnce(async () => {
+      await gate;
+      return { ok: false, code: 'NETWORK_ERROR' };
+    });
+    deps.rebindSession.mockImplementation(async () => {
+      bound = true;
+      return { ok: true };
+    });
+    deps.fetchImpl.mockImplementation(async () =>
+      bound ? jsonResponse(200, {}) : errorResponse(403, 'SESSION_NOT_BOUND'),
+    );
+    const client = createApiClient(deps);
+
+    const all = Promise.all([client.request('/api/v1/a'), client.request('/api/v1/b')]);
+    await vi.waitFor(() => expect(deps.rebindSession).toHaveBeenCalled());
+    release();
+    expect(await all).toEqual(Array(2).fill({ ok: false, error: { kind: 'NETWORK_ERROR' } }));
+    expect(deps.rebindSession).toHaveBeenCalledOnce();
+    expect(deps.forceSignOut).not.toHaveBeenCalled();
+
+    expect((await client.request('/api/v1/c')).ok).toBe(true);
+    expect(deps.rebindSession).toHaveBeenCalledTimes(2);
+  });
 
   it('forces sign-out when the retry after a re-bind is still SESSION_NOT_BOUND', async () => {
     const { deps } = makeDeps();
@@ -400,7 +519,8 @@ describe('apiClient: one deadline for the whole request', () => {
 
   it('times out (without signing out) when the refresh hangs', async () => {
     vi.useFakeTimers();
-    const { deps } = makeDeps({ refreshAccessToken: vi.fn(() => new Promise<string | null>(() => undefined)) });
+    const { deps } = makeDeps();
+    deps.refreshAccessToken.mockImplementation(() => new Promise<RefreshResult>(() => undefined));
     deps.fetchImpl.mockImplementation(async () => errorResponse(401, 'UNAUTHENTICATED'));
     const pending = createApiClient(deps).request('/api/v1/x', { timeoutMs: 5000 });
     await vi.advanceTimersByTimeAsync(5000);

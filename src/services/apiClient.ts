@@ -6,14 +6,20 @@
  *
  * | Response                | Action                                                            |
  * |-------------------------|-------------------------------------------------------------------|
- * | 401                     | single-flight token refresh, retry ONCE; else forced sign-out     |
- * |                         | (SESSION_EXPIRED)                                                 |
+ * | 401                     | single-flight token refresh, retry ONCE. Refresh definitively     |
+ * |                         | rejected or retry still 401 -> forced sign-out (SESSION_EXPIRED)  |
  * | 403 DEVICE_REVOKED      | forced sign-out with that reason                                  |
  * | 403 ACCOUNT_DISABLED    | forced sign-out with that reason                                  |
- * | 403 SESSION_NOT_BOUND   | single-flight re-bind (POST /auth/session), retry ONCE; else      |
- * |                         | forced sign-out                                                   |
+ * | 403 SESSION_NOT_BOUND   | single-flight re-bind (POST /auth/session), retry ONCE. Re-bind   |
+ * |                         | DEVICE_REVOKED / ACCOUNT_DISABLED / 401, or retry still           |
+ * |                         | SESSION_NOT_BOUND -> forced sign-out                              |
  * | 403 ROLE_FORBIDDEN      | typed error, NO sign-out                                          |
  * | 429/5xx/network/timeout | typed error, NO sign-out                                          |
+ *
+ * D4a: sign out ONLY on a definitive rejection. A transient failure DURING refresh or re-bind
+ * (network, 5xx, 429, timeout) returns a typed error without sign-out and without a further retry;
+ * the next request simply tries again (no failure is cached). Scenario: the crisis centre's
+ * internet drops for 2 s exactly when the token is refreshed -> the coordinator stays signed in.
  *
  * At most one retry per request; after the retry no further refresh or re-bind is attempted.
  *
@@ -76,13 +82,25 @@ export interface ApiRequestOptions {
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
+/** Transient failure kinds of a refresh / re-bind (D4a): never a reason to sign out. */
+export type TransientKind = 'NETWORK_ERROR' | 'SERVER_ERROR' | 'RATE_LIMITED';
+
+/**
+ * Outcome of a Supabase session refresh. `definitive` = the refresh token was rejected (4xx auth
+ * error) or there is no session to refresh; anything else is transient.
+ */
+export type RefreshResult =
+  | { ok: true; accessToken: string }
+  | { ok: false; definitive: true }
+  | { ok: false; definitive: false; kind: TransientKind; status?: number };
+
 export interface ApiClientDeps {
   baseUrl: string;
   fetchImpl: FetchLike;
   /** Current access token from the Supabase session, or null when signed out. */
   getAccessToken(): Promise<string | null>;
-  /** Refreshes the Supabase session; returns the new access token, or null on failure. */
-  refreshAccessToken(): Promise<string | null>;
+  /** Refreshes the Supabase session and classifies a failure (see RefreshResult). */
+  refreshAccessToken(): Promise<RefreshResult>;
   /** POST /api/v1/auth/session for this browser (existing OSP-60 client). */
   rebindSession(accessToken: string): Promise<RegisterSessionResult>;
   forceSignOut(reason: ForcedSignOutReason, accessToken: string | null): Promise<void>;
@@ -98,17 +116,24 @@ type Attempt =
   | { type: 'network' }
   | { type: 'timeout' };
 
-type RebindOutcome = { ok: true } | { ok: false; reason: ForcedSignOutReason };
+type RebindOutcome =
+  | { ok: true }
+  | { ok: false; signOut: ForcedSignOutReason }
+  | { ok: false; error: ApiError };
+
+const TRANSIENT_NETWORK: RefreshResult = { ok: false, definitive: false, kind: 'NETWORK_ERROR' };
 
 export function createApiClient(deps: ApiClientDeps): ApiClient {
-  let refreshInFlight: Promise<string | null> | null = null;
+  // Single-flight: concurrent callers share one attempt. The slot is cleared when the attempt
+  // settles, so a (transient) failure is never cached and the next request tries again.
+  let refreshInFlight: Promise<RefreshResult> | null = null;
   let rebindInFlight: Promise<RebindOutcome> | null = null;
 
-  function refreshOnce(): Promise<string | null> {
+  function refreshOnce(): Promise<RefreshResult> {
     if (!refreshInFlight) {
       refreshInFlight = deps
         .refreshAccessToken()
-        .catch(() => null)
+        .catch(() => TRANSIENT_NETWORK)
         .finally(() => {
           refreshInFlight = null;
         });
@@ -120,9 +145,9 @@ export function createApiClient(deps: ApiClientDeps): ApiClient {
    * A token that differs from the one we sent means another request (or the SDK's auto-refresh)
    * already refreshed the session; use it instead of refreshing again.
    */
-  async function freshTokenAfter401(usedToken: string): Promise<string | null> {
+  async function freshTokenAfter401(usedToken: string): Promise<RefreshResult> {
     const current = await deps.getAccessToken().catch(() => null);
-    if (current && current !== usedToken) return current;
+    if (current && current !== usedToken) return { ok: true, accessToken: current };
     return refreshOnce();
   }
 
@@ -130,19 +155,14 @@ export function createApiClient(deps: ApiClientDeps): ApiClient {
     if (!rebindInFlight) {
       rebindInFlight = (async (): Promise<RebindOutcome> => {
         const token = await deps.getAccessToken().catch(() => null);
-        if (!token) return { ok: false, reason: 'SESSION_EXPIRED' };
+        if (!token) return { ok: false, signOut: 'SESSION_EXPIRED' }; // no session to bind
         let result: RegisterSessionResult;
         try {
           result = await deps.rebindSession(token);
         } catch {
-          return { ok: false, reason: 'SESSION_NOT_BOUND' };
+          return { ok: false, error: { kind: 'NETWORK_ERROR' } };
         }
-        if (result.ok) return { ok: true };
-        if (result.code === 'DEVICE_REVOKED' || result.code === 'ACCOUNT_DISABLED') {
-          return { ok: false, reason: result.code };
-        }
-        // D4: any other re-bind failure (network, 429, unknown, ...) ends the session.
-        return { ok: false, reason: 'SESSION_NOT_BOUND' };
+        return classifyRebind(result);
       })().finally(() => {
         rebindInFlight = null;
       });
@@ -217,13 +237,21 @@ export function createApiClient(deps: ApiClientDeps): ApiClient {
       const fresh = await withDeadline(freshTokenAfter401(token), remaining());
       if (fresh === TIMED_OUT) return TIMEOUT;
       if (!recoveryAllowed()) return toResult<T>(first);
-      if (!fresh) return forced('SESSION_EXPIRED', token, first);
-      retryToken = fresh;
+      if (!fresh.ok) {
+        if (fresh.definitive) return forced('SESSION_EXPIRED', token, first);
+        // D4a: transient refresh failure -> typed error, stay signed in, no retry.
+        return { ok: false, error: transientError(fresh.kind, fresh.status) };
+      }
+      retryToken = fresh.accessToken;
     } else if (first.status === 403 && first.errorCode === 'SESSION_NOT_BOUND') {
       const rebind = await withDeadline(rebindOnce(), remaining());
       if (rebind === TIMED_OUT) return TIMEOUT;
       if (!recoveryAllowed()) return toResult<T>(first);
-      if (!rebind.ok) return forced(rebind.reason, token, first);
+      if (!rebind.ok) {
+        if ('signOut' in rebind) return forced(rebind.signOut, token, first);
+        // D4a: transient re-bind failure -> typed error, stay signed in, no retry.
+        return { ok: false, error: rebind.error };
+      }
       const current = await withDeadline(deps.getAccessToken().catch(() => null), remaining());
       if (current === TIMED_OUT) return TIMEOUT;
       retryToken = current ?? token;
@@ -246,6 +274,30 @@ export function createApiClient(deps: ApiClientDeps): ApiClient {
   }
 
   return { request };
+}
+
+function transientError(kind: TransientKind, status?: number): ApiError {
+  return status !== undefined ? { kind, status } : { kind };
+}
+
+/**
+ * Re-bind (POST /auth/session) outcome per D4/D4a. Definitive: DEVICE_REVOKED / ACCOUNT_DISABLED
+ * (sign out with that reason) and 401 (SESSION_EXPIRED). Everything else is a typed error.
+ */
+function classifyRebind(result: RegisterSessionResult): RebindOutcome {
+  if (result.ok) return { ok: true };
+  const { code, status } = result;
+  if (code === 'DEVICE_REVOKED' || code === 'ACCOUNT_DISABLED') return { ok: false, signOut: code };
+  if (status === 401) return { ok: false, signOut: 'SESSION_EXPIRED' };
+  if (code === 'NETWORK_ERROR') return { ok: false, error: { kind: 'NETWORK_ERROR' } };
+  if (code === 'RATE_LIMITED' || status === 429) {
+    return { ok: false, error: { kind: 'RATE_LIMITED', status: 429 } };
+  }
+  if (status !== undefined && status >= 500) return { ok: false, error: { kind: 'SERVER_ERROR', status } };
+  const kind: ApiErrorKind = status === 403 ? 'FORBIDDEN' : 'HTTP_ERROR';
+  const error: ApiError = { kind, errorCode: code };
+  if (status !== undefined) error.status = status;
+  return { ok: false, error };
 }
 
 const TIMED_OUT = Symbol('timed out');

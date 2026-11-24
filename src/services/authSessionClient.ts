@@ -20,7 +20,10 @@ export type SessionErrorCode =
   | 'NETWORK_ERROR'
   | 'UNKNOWN';
 
-export type RegisterSessionResult = { ok: true } | { ok: false; code: SessionErrorCode };
+/** `status` is the HTTP status of a rejected request (absent for network errors). */
+export type RegisterSessionResult =
+  | { ok: true }
+  | { ok: false; code: SessionErrorCode; status?: number };
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -70,7 +73,8 @@ export async function registerBrowserSession(
     code = undefined;
   }
 
-  if (response.status === 429) return { ok: false, code: 'RATE_LIMITED' };
-  if (code && KNOWN_CODES.has(code)) return { ok: false, code: code as SessionErrorCode };
-  return { ok: false, code: 'UNKNOWN' };
+  const status = response.status;
+  if (status === 429) return { ok: false, code: 'RATE_LIMITED', status };
+  if (code && KNOWN_CODES.has(code)) return { ok: false, code: code as SessionErrorCode, status };
+  return { ok: false, code: 'UNKNOWN', status };
 }

@@ -8,6 +8,7 @@ import { registerBrowserSession } from '../services/authSessionClient';
 import { getOrCreateDeviceId } from '../services/deviceId';
 import { createForcedSignOut } from './forcedSignOut';
 import { isLogoutPending } from './logout';
+import { classifyRefresh } from './refreshResult';
 import type { AuthProviderDeps } from './AuthProvider';
 
 /**
@@ -47,11 +48,7 @@ export const apiClient = createApiClient({
     const { data } = await supabase.auth.getSession();
     return data.session?.access_token ?? null;
   },
-  refreshAccessToken: async () => {
-    const { data, error } = await supabase.auth.refreshSession();
-    if (error) return null;
-    return data.session?.access_token ?? null;
-  },
+  refreshAccessToken: async () => classifyRefresh(await supabase.auth.refreshSession()),
   rebindSession: (accessToken) =>
     registerBrowserSession(
       { deviceId: getOrCreateDeviceId(), deviceName: navigator.userAgent.slice(0, 100) },

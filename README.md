@@ -131,12 +131,13 @@ Backend calls go through `apiClient.request(path, options)` (`src/services/apiCl
 
 | Response | What the client does |
 | --- | --- |
-| 401 | One shared session refresh, then **one** retry. If the refresh fails or the retry is 401 again: forced sign-out (`SESSION_EXPIRED`). |
+| 401 | One shared session refresh, then **one** retry. Supabase rejects the refresh token (4xx, `session_not_found`, no session), or the retry is 401 again: forced sign-out (`SESSION_EXPIRED`). The refresh fails for a transient reason (network, 5xx, 429, timeout): typed error, **no sign-out**. |
 | 403 `DEVICE_REVOKED` / `ACCOUNT_DISABLED` | Forced sign-out with that reason. |
-| 403 `SESSION_NOT_BOUND` | One shared `POST /api/v1/auth/session` (re-bind), then **one** retry. Re-bind refused with `DEVICE_REVOKED` / `ACCOUNT_DISABLED`: forced sign-out with that reason. Any other re-bind failure (including network errors and 429), or the retry is `SESSION_NOT_BOUND` again: forced sign-out (`SESSION_NOT_BOUND`). |
+| 403 `SESSION_NOT_BOUND` | One shared `POST /api/v1/auth/session` (re-bind), then **one** retry. Re-bind refused with `DEVICE_REVOKED` / `ACCOUNT_DISABLED`: forced sign-out with that reason. Re-bind answered 401: forced sign-out (`SESSION_EXPIRED`). The retry is `SESSION_NOT_BOUND` again: forced sign-out (`SESSION_NOT_BOUND`). Any other re-bind failure (network, 429, 5xx, timeout, other error): typed error, **no sign-out**. |
 | 403 `ROLE_FORBIDDEN` | Typed error `ROLE_FORBIDDEN`, no sign-out. Show `ROLE_FORBIDDEN_MESSAGE` ("Bu işlem için yetkiniz yok."). |
 | 429, 5xx, network error, timeout, other | Typed error, no sign-out. |
 
+- **Sign-out only on a definitive rejection (D4a).** A transient failure while refreshing or re-binding returns a typed error (`NETWORK_ERROR`, `SERVER_ERROR`, `RATE_LIMITED` or `TIMEOUT`) without a retry. The next request simply tries again, because no failure is cached. Example: the crisis centre's internet drops for 2 s exactly when the token is refreshed, and the coordinator stays signed in.
 - Each request is retried at most once. After the retry no further refresh or re-bind happens.
 - Concurrent 401s share one refresh, and concurrent `SESSION_NOT_BOUND` responses share one re-bind.
 - A **forced sign-out** stores the reason for `/login`, signs out with `scope: 'local'`, and navigates to `/login`. Concurrent forced sign-outs produce one navigation and one message. It never calls `/auth/logout`, because the backend has already rejected the token.

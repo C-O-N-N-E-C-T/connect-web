@@ -3,6 +3,7 @@
  * that a forced sign-out never calls /auth/logout, and that logout runs without recovery.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { AuthApiError, AuthRetryableFetchError } from '@supabase/supabase-js';
 import { SIGNOUT_REASON_KEY } from './forcedSignOut';
 
 const mocks = vi.hoisted(() => ({
@@ -101,9 +102,27 @@ describe('authRuntime', () => {
     expect(mocks.signOut).not.toHaveBeenCalled();
   });
 
-  it('a failed refresh (SDK error) ends in a forced sign-out with SESSION_EXPIRED', async () => {
+  it('a network failure during refresh keeps the user signed in (D4a)', async () => {
+    mocks.getSession.mockResolvedValue(sessionWith('tok-offline'));
+    mocks.refreshSession.mockResolvedValue({
+      data: { session: null, user: null },
+      error: new AuthRetryableFetchError('Failed to fetch', 0),
+    });
+    fetchMock.mockResolvedValue(json(401, { error_code: 'UNAUTHENTICATED', message: 'x' }));
+
+    const result = await apiClient.request('/api/v1/auth/me');
+
+    expect(result).toEqual({ ok: false, error: { kind: 'NETWORK_ERROR' } });
+    expect(mocks.signOut).not.toHaveBeenCalled();
+    expect(window.sessionStorage.getItem(SIGNOUT_REASON_KEY)).toBeNull();
+  });
+
+  it('a rejected refresh token (SDK 4xx) ends in a forced sign-out with SESSION_EXPIRED', async () => {
     mocks.getSession.mockResolvedValue(sessionWith('tok-expired'));
-    mocks.refreshSession.mockResolvedValue({ data: { session: null }, error: { message: 'invalid' } });
+    mocks.refreshSession.mockResolvedValue({
+      data: { session: null, user: null },
+      error: new AuthApiError('Invalid Refresh Token: Refresh Token Not Found', 400, 'refresh_token_not_found'),
+    });
     fetchMock.mockResolvedValue(json(401, { error_code: 'UNAUTHENTICATED', message: 'x' }));
 
     const result = await apiClient.request('/api/v1/auth/me');
