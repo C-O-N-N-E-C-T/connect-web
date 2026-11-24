@@ -388,6 +388,38 @@ describe('apiClient: errors that never sign out', () => {
   });
 });
 
+describe('apiClient: one deadline for the whole request', () => {
+  it('times out when getting the token hangs (no request is sent)', async () => {
+    vi.useFakeTimers();
+    const { deps } = makeDeps({ getAccessToken: vi.fn(() => new Promise<string | null>(() => undefined)) });
+    const pending = createApiClient(deps).request('/api/v1/x', { timeoutMs: 5000 });
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(await pending).toEqual({ ok: false, error: { kind: 'TIMEOUT' } });
+    expect(deps.fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('times out (without signing out) when the refresh hangs', async () => {
+    vi.useFakeTimers();
+    const { deps } = makeDeps({ refreshAccessToken: vi.fn(() => new Promise<string | null>(() => undefined)) });
+    deps.fetchImpl.mockImplementation(async () => errorResponse(401, 'UNAUTHENTICATED'));
+    const pending = createApiClient(deps).request('/api/v1/x', { timeoutMs: 5000 });
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(await pending).toEqual({ ok: false, error: { kind: 'TIMEOUT' } });
+    expect(deps.forceSignOut).not.toHaveBeenCalled();
+  });
+
+  it('times out (without signing out) when the re-bind hangs', async () => {
+    vi.useFakeTimers();
+    const { deps } = makeDeps();
+    deps.rebindSession.mockImplementation(() => new Promise(() => undefined));
+    deps.fetchImpl.mockImplementation(async () => errorResponse(403, 'SESSION_NOT_BOUND'));
+    const pending = createApiClient(deps).request('/api/v1/x', { timeoutMs: 5000 });
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(await pending).toEqual({ ok: false, error: { kind: 'TIMEOUT' } });
+    expect(deps.forceSignOut).not.toHaveBeenCalled();
+  });
+});
+
 describe('apiClient: recovery disabled (logout)', () => {
   it.each([
     [401, 'UNAUTHENTICATED', 'UNAUTHENTICATED'],

@@ -4,6 +4,7 @@
  * out, /login shows the reason. Real API client, forced sign-out, provider, guard and login page;
  * only Supabase and fetch are faked.
  */
+import { StrictMode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
@@ -33,6 +34,7 @@ beforeEach(() => {
   window.sessionStorage.clear();
 });
 
+// StrictMode like `npm run dev` (main.tsx): effects and state initializers run twice.
 describe.each([
   ['DEVICE_REVOKED', 'Bu cihazın erişimi iptal edildi.'],
   ['ACCOUNT_DISABLED', 'Hesabınız devre dışı bırakıldı. Yöneticinize başvurun.'],
@@ -69,21 +71,23 @@ describe.each([
     deps.fetchMe.mockImplementation(() => client.request('/api/v1/auth/me'));
 
     render(
-      <MemoryRouter initialEntries={['/dashboard']}>
-        <AuthProvider deps={deps}>
-          <Routes>
-            <Route path="/login" element={<LoginPage />} />
-            <Route
-              path="/dashboard"
-              element={
-                <RequireRole allow={['coordinator']}>
-                  <AppLayout title="Koordinasyon Paneli" />
-                </RequireRole>
-              }
-            />
-          </Routes>
-        </AuthProvider>
-      </MemoryRouter>,
+      <StrictMode>
+        <MemoryRouter initialEntries={['/dashboard']}>
+          <AuthProvider deps={deps}>
+            <Routes>
+              <Route path="/login" element={<LoginPage />} />
+              <Route
+                path="/dashboard"
+                element={
+                  <RequireRole allow={['coordinator']}>
+                    <AppLayout title="Koordinasyon Paneli" />
+                  </RequireRole>
+                }
+              />
+            </Routes>
+          </AuthProvider>
+        </MemoryRouter>
+      </StrictMode>,
     );
 
     expect(await screen.findByText('Koordinasyon Paneli')).toBeInTheDocument();

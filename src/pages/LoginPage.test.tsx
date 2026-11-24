@@ -1,3 +1,4 @@
+import { StrictMode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -158,6 +159,19 @@ describe('LoginPage: forced sign-out reason (OSP-70)', () => {
     first.unmount();
     renderLogin();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('keeps the reason visible under StrictMode (double initializer and effects)', () => {
+    window.sessionStorage.setItem(SIGNOUT_REASON_KEY, 'DEVICE_REVOKED');
+    render(
+      <StrictMode>
+        <MemoryRouter>
+          <LoginPage />
+        </MemoryRouter>
+      </StrictMode>,
+    );
+    expect(screen.getByRole('alert')).toHaveTextContent('Bu cihazın erişimi iptal edildi.');
+    expect(window.sessionStorage.getItem(SIGNOUT_REASON_KEY)).toBeNull();
   });
 
   it('ignores an unknown stored value', () => {

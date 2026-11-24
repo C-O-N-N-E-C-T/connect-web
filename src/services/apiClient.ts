@@ -65,6 +65,10 @@ export interface ApiRequestOptions {
   method?: HttpMethod;
   /** Serialized as JSON. */
   body?: unknown;
+  /**
+   * Total time budget of the request in ms (default DEFAULT_TIMEOUT_MS), covering token lookup,
+   * the request, any refresh / re-bind and the retry. When it runs out the result is TIMEOUT.
+   */
   timeoutMs?: number;
   /** Default true. false = no refresh, no re-bind, no retry, no forced sign-out. */
   recovery?: boolean;
@@ -146,13 +150,19 @@ export function createApiClient(deps: ApiClientDeps): ApiClient {
     return rebindInFlight;
   }
 
-  async function send(path: string, token: string, options: ApiRequestOptions): Promise<Attempt> {
+  async function send(
+    path: string,
+    token: string,
+    options: ApiRequestOptions,
+    timeoutMs: number,
+  ): Promise<Attempt> {
+    if (timeoutMs <= 0) return { type: 'timeout' };
     const controller = new AbortController();
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
       controller.abort();
-    }, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+    }, timeoutMs);
 
     const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
     if (options.body !== undefined) headers['Content-Type'] = 'application/json';
@@ -189,24 +199,34 @@ export function createApiClient(deps: ApiClientDeps): ApiClient {
       throw new Error(`apiClient: path must start with a single "/": ${path}`);
     }
     const recoveryAllowed = () => options.recovery !== false && !deps.isLogoutPending();
+    // One deadline for the whole request: getSession() / refreshSession() can themselves hang
+    // (offline with an expired token, contended auth lock), and the logout must never get stuck.
+    const deadlineAt = Date.now() + (options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+    const remaining = () => deadlineAt - Date.now();
+    const TIMEOUT: ApiResult<never> = { ok: false, error: { kind: 'TIMEOUT' } };
 
-    const token = await deps.getAccessToken().catch(() => null);
+    const token = await withDeadline(deps.getAccessToken().catch(() => null), remaining());
+    if (token === TIMED_OUT) return TIMEOUT;
     if (!token) return { ok: false, error: { kind: 'UNAUTHENTICATED' } };
 
-    const first = await send(path, token, options);
+    const first = await send(path, token, options, remaining());
     if (first.type !== 'response' || !recoveryAllowed()) return toResult<T>(first);
 
     let retryToken: string;
     if (first.status === 401) {
-      const fresh = await freshTokenAfter401(token);
+      const fresh = await withDeadline(freshTokenAfter401(token), remaining());
+      if (fresh === TIMED_OUT) return TIMEOUT;
       if (!recoveryAllowed()) return toResult<T>(first);
       if (!fresh) return forced('SESSION_EXPIRED', token, first);
       retryToken = fresh;
     } else if (first.status === 403 && first.errorCode === 'SESSION_NOT_BOUND') {
-      const rebind = await rebindOnce();
+      const rebind = await withDeadline(rebindOnce(), remaining());
+      if (rebind === TIMED_OUT) return TIMEOUT;
       if (!recoveryAllowed()) return toResult<T>(first);
       if (!rebind.ok) return forced(rebind.reason, token, first);
-      retryToken = (await deps.getAccessToken().catch(() => null)) ?? token;
+      const current = await withDeadline(deps.getAccessToken().catch(() => null), remaining());
+      if (current === TIMED_OUT) return TIMEOUT;
+      retryToken = current ?? token;
     } else {
       const terminal = terminalReason(first);
       if (terminal) return forced(terminal, token, first);
@@ -214,7 +234,7 @@ export function createApiClient(deps: ApiClientDeps): ApiClient {
     }
 
     // The single retry. Whatever happens now, no further refresh / re-bind.
-    const second = await send(path, retryToken, options);
+    const second = await send(path, retryToken, options, remaining());
     if (second.type !== 'response' || !recoveryAllowed()) return toResult<T>(second);
     if (second.status === 401) return forced('SESSION_EXPIRED', retryToken, second);
     if (second.status === 403 && second.errorCode === 'SESSION_NOT_BOUND') {
@@ -226,6 +246,18 @@ export function createApiClient(deps: ApiClientDeps): ApiClient {
   }
 
   return { request };
+}
+
+const TIMED_OUT = Symbol('timed out');
+
+/** Resolves to TIMED_OUT if `promise` has not settled within `ms`. */
+function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
+  if (ms <= 0) return Promise.resolve(TIMED_OUT);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<typeof TIMED_OUT>((resolve) => {
+    timer = setTimeout(() => resolve(TIMED_OUT), ms);
+  });
+  return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
 }
 
 function terminalReason(attempt: Attempt): ForcedSignOutReason | null {

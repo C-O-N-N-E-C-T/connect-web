@@ -127,7 +127,7 @@ The login form validates the email format and that the password is not empty bef
 
 ### API client
 
-Backend calls go through `apiClient.request(path, options)` (`src/services/apiClient.ts`, wired in `src/auth/authRuntime.ts`). It adds `Authorization: Bearer <access_token>`, accepts only paths that start with `/` (so the token is only sent to `VITE_API_BASE_URL`), uses a 15 s timeout by default, and returns a typed result (`{ ok: true, data }` or `{ ok: false, error: { kind, status?, errorCode?, reason? } }`). It never throws for HTTP or network errors.
+Backend calls go through `apiClient.request(path, options)` (`src/services/apiClient.ts`, wired in `src/auth/authRuntime.ts`). It adds `Authorization: Bearer <access_token>`, accepts only paths that start with `/` (so the token is only sent to `VITE_API_BASE_URL`), has one time budget per request (15 s by default) that covers reading the session, the request, any refresh or re-bind, and the retry (when it runs out the result is `TIMEOUT`, without sign-out), and returns a typed result (`{ ok: true, data }` or `{ ok: false, error: { kind, status?, errorCode?, reason? } }`). It never throws for HTTP or network errors.
 
 | Response | What the client does |
 | --- | --- |

@@ -45,11 +45,14 @@ describe('performLogout', () => {
  * still end in signOut, and no refresh / re-bind / forced sign-out may happen.
  */
 describe('logout through the API client', () => {
-  function setup(fetchImpl: ApiClientDeps['fetchImpl']) {
+  function setup(
+    fetchImpl: ApiClientDeps['fetchImpl'],
+    getAccessToken: ApiClientDeps['getAccessToken'] = async () => 'tok',
+  ) {
     const clientDeps = {
       baseUrl: 'http://api.test',
       fetchImpl: vi.fn(fetchImpl),
-      getAccessToken: vi.fn().mockResolvedValue('tok'),
+      getAccessToken: vi.fn(getAccessToken),
       refreshAccessToken: vi.fn().mockResolvedValue('tok-2'),
       rebindSession: vi.fn().mockResolvedValue({ ok: true }),
       forceSignOut: vi.fn().mockResolvedValue(undefined),
@@ -114,6 +117,22 @@ describe('logout through the API client', () => {
     await done;
     expect(signOut).toHaveBeenCalledOnce();
     expect(clientDeps.fetchImpl).toHaveBeenCalledOnce();
+    expect(window.localStorage.getItem(LOGOUT_PENDING_KEY)).toBeNull();
+  });
+
+  it('still signs out after 5 s when reading the session hangs (offline, expired token)', async () => {
+    vi.useFakeTimers();
+    const { clientDeps, signOut, run } = setup(
+      async () => new Response(null, { status: 204 }),
+      () => new Promise<string | null>(() => undefined),
+    );
+    const done = run();
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(signOut).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await done;
+    expect(signOut).toHaveBeenCalledOnce();
+    expect(clientDeps.fetchImpl).not.toHaveBeenCalled();
     expect(window.localStorage.getItem(LOGOUT_PENDING_KEY)).toBeNull();
   });
 });
