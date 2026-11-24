@@ -38,6 +38,8 @@ npm run dev              # http://localhost:5173
 
 Start the backend first. Login calls `POST /api/v1/auth/session` on the backend in the default `real` mode, so the backend must be running for sign-in to complete.
 
+The session check uses `GET /api/v1/auth/me`, which is added by the backend branch `OSP-70`. That branch must be merged/deployed for the check to work. Without it the endpoint answers 404, which the app treats as a plain error (no sign-out), so the dashboard still works but revocations are only noticed through other API calls.
+
 ## Environment variables
 
 Create `.env` from `.env.example`. Vite only exposes variables prefixed with `VITE_`.
@@ -69,7 +71,7 @@ Rules:
 Login uses Supabase directly (`signInWithPassword`). After a successful login the app also registers the browser session with the backend (`POST /api/v1/auth/session`, OSP-60).
 
 - `VITE_AUTH_SESSION_MODE=real` (default in `.env.example`): calls the backend. The contract is documented in `connect-backend/docs/osp-60-auth-session.md`. Success returns 200 with `{ user_id, role, device_id }`. Errors use `{ error_code, message }`: `ACCOUNT_DISABLED` and `DEVICE_REVOKED` return 403, `RATE_LIMITED` returns 429.
-- `VITE_AUTH_SESSION_MODE=mock`: skips the backend call and treats registration as successful. Use only for offline UI work without the backend.
+- `VITE_AUTH_SESSION_MODE=mock`: skips the backend calls and treats registration as successful. `GET /api/v1/auth/me` and `POST /api/v1/auth/logout` are skipped too. Use only for offline UI work without the backend.
 
 Restart `npm run dev` after changing `.env`. Vite reads environment variables only at startup.
 
@@ -98,7 +100,69 @@ To create test accounts, see the backend README (`npm run seed`) or the Supabase
 | Rescuer account | "Saha kurtarıcı hesapları web panelinden giriş yapamaz." |
 | `ACCOUNT_DISABLED`, `DEVICE_REVOKED`, `RATE_LIMITED` from the backend | Specific message per code |
 
+After a forced sign-out (see "API client" below) the login page shows why the session ended. The reason is passed in `sessionStorage` (`connect.signout_reason`), shown once and then cleared.
+
+| Reason | Message |
+| --- | --- |
+| `DEVICE_REVOKED` | "Bu cihazın erişimi iptal edildi." |
+| `ACCOUNT_DISABLED` | "Hesabınız devre dışı bırakıldı. Yöneticinize başvurun." |
+| `SESSION_NOT_BOUND` | "Oturum cihaza bağlanamadı. Tekrar giriş yapın." |
+| `ROLE_NOT_ALLOWED` | "Saha kurtarıcı hesapları web panelinden giriş yapamaz." |
+| `SESSION_EXPIRED` | "Oturumunuzun süresi doldu. Lütfen tekrar giriş yapın." |
+
 The login form validates the email format and that the password is not empty before submitting. The password field has a show/hide toggle.
+
+## Session handling (OSP-70)
+
+### AuthProvider
+
+`src/auth/AuthProvider.tsx` holds the session and role for the whole app. Components read them with `useAuth()` (`status`: `loading` | `signedIn` | `signedOut`, `session`, `role`, `logout()`).
+
+- On start it reads the stored Supabase session (`getSession()`), so the session and role survive a page reload. It then subscribes to `onAuthStateChange` (sign-in, token refresh, sign-out in another tab). The callback only updates state; it never awaits a Supabase call (known supabase-js deadlock).
+- The role starts as the JWT `user_role` claim. `GET /api/v1/auth/me` then returns the role from the database, and **the server role wins**. A non-web role (`rescuer`) is signed out with `ROLE_NOT_ALLOWED`.
+- `GET /api/v1/auth/me` runs once on start (when there is a session) and again when the tab becomes visible (`visibilitychange`). There is no polling. A check already in flight is reused, and a visibility check is skipped if the last one started less than 10 s ago. It is not called on `/login`, where a sign-in may be in progress.
+- The panel renders with the JWT role right away. It does not wait for `/auth/me`, and corrects the role (or signs out) when the answer arrives.
+- Why `/auth/me` and not an existing endpoint: the panels make no backend calls yet, so a revoked device would otherwise only be noticed later. `GET /api/v1/victims` writes an audit row on every call (OSP-65) and downloads sensitive data, so it is not used as a ping.
+- `RequireRole` uses `useAuth()`. It shows "Yükleniyor…" while the status is `loading`, and still re-checks the session when a page is restored from the back/forward cache.
+
+### API client
+
+Backend calls go through `apiClient.request(path, options)` (`src/services/apiClient.ts`, wired in `src/auth/authRuntime.ts`). It adds `Authorization: Bearer <access_token>`, accepts only paths that start with `/` (so the token is only sent to `VITE_API_BASE_URL`), uses a 15 s timeout by default, and returns a typed result (`{ ok: true, data }` or `{ ok: false, error: { kind, status?, errorCode?, reason? } }`). It never throws for HTTP or network errors.
+
+| Response | What the client does |
+| --- | --- |
+| 401 | One shared session refresh, then **one** retry. If the refresh fails or the retry is 401 again: forced sign-out (`SESSION_EXPIRED`). |
+| 403 `DEVICE_REVOKED` / `ACCOUNT_DISABLED` | Forced sign-out with that reason. |
+| 403 `SESSION_NOT_BOUND` | One shared `POST /api/v1/auth/session` (re-bind), then **one** retry. Re-bind refused with `DEVICE_REVOKED` / `ACCOUNT_DISABLED`: forced sign-out with that reason. Any other re-bind failure (including network errors and 429), or the retry is `SESSION_NOT_BOUND` again: forced sign-out (`SESSION_NOT_BOUND`). |
+| 403 `ROLE_FORBIDDEN` | Typed error `ROLE_FORBIDDEN`, no sign-out. Show `ROLE_FORBIDDEN_MESSAGE` ("Bu işlem için yetkiniz yok."). |
+| 429, 5xx, network error, timeout, other | Typed error, no sign-out. |
+
+- Each request is retried at most once. After the retry no further refresh or re-bind happens.
+- Concurrent 401s share one refresh, and concurrent `SESSION_NOT_BOUND` responses share one re-bind.
+- A **forced sign-out** stores the reason for `/login`, signs out with `scope: 'local'`, and navigates to `/login`. Concurrent forced sign-outs produce one navigation and one message. It never calls `/auth/logout`, because the backend has already rejected the token.
+- `recovery: false` turns off refresh, re-bind, retry and forced sign-out. Logout uses it. All of these are also off for every request while a logout is pending.
+
+### Logout
+
+The "Çıkış yap" button (`AppLayout`) runs this flow:
+
+1. The button is disabled and shows "Çıkış yapılıyor…". Extra clicks are ignored.
+2. `localStorage['connect.logout_pending'] = '1'` is written **before** any network call.
+3. `POST /api/v1/auth/logout` runs with a 5 s timeout and recovery turned off. The flow continues whatever the outcome (network error, 5xx, 401, 403, 429, timeout).
+4. `supabase.auth.signOut({ scope: 'local' })`.
+5. The flag is removed and the app navigates to `/login`.
+
+If the browser is closed or reloaded during step 3, the flag survives. On the next start, `AuthProvider` finishes the logout before showing anything: it tries `/auth/logout` once more with a 3 s timeout, signs out locally, removes the flag and goes to `/login`. No protected screen is rendered meanwhile.
+
+Every sign-out in the web app uses `scope: 'local'`. With the default `global` scope, a network or 5xx failure keeps the local session, so the user silently stays signed in. `global` would also end the user's sessions on other devices.
+
+### Known limits
+
+- The `connect.logout_pending` flag is **not** a security control. Someone who controls the browser can block `/auth/logout`, delete the flag or copy the token, but they only keep their own session, which they could also do by not pressing logout. Enforcement happens on the server: the OSP-61 guard checks every request (`DEVICE_REVOKED` / `ACCOUNT_DISABLED`), access tokens expire (~1 h), and refresh tokens can be revoked.
+- The `LOGOUT` audit row is written only when the client reaches `/auth/logout`, so it can be suppressed.
+- If `/auth/logout` did not succeed, a copied access token stays usable at the backend until it expires.
+- A revoked device is noticed on the next backend call: on start, when the tab becomes visible again, or on any later API call. There is no polling.
+- `/api/v1/auth/*` is rate-limited to 10 requests per minute per IP. Visibility checks share this budget with login and logout, also with other users behind the same NAT. A 429 is a typed error and does not sign the user out.
 
 ## Project structure
 
@@ -108,6 +172,10 @@ src/
   main.tsx                 entry point, imports styles.css
   styles.css               all styles (single stylesheet)
   auth/
+    AuthProvider.tsx       session + role state, useAuth(), /auth/me check, interrupted-logout recovery
+    authRuntime.ts         app wiring: Supabase, API client, forced sign-out
+    forcedSignOut.ts       forced sign-out (reason for /login, local sign-out, navigation)
+    logout.ts              logout flow with the pending flag
     login.ts               login flow (dependency-injected, unit tested)
     RequireRole.tsx        route guard by role
   components/
@@ -124,6 +192,7 @@ src/
     CoordinatorDashboard.tsx   placeholder
     AdminPage.tsx              placeholder
   services/
+    apiClient.ts           backend API client with unified 401/403 handling
     authSessionClient.ts   backend session registration (mock or real)
     deviceId.ts            per-browser device id in localStorage
 ```
@@ -134,7 +203,7 @@ src/
 npm test
 ```
 
-Tests cover the login flow and error mapping, role routing, JWT claim reading, the session client, and the login and panel screens. Tests use a fixed test environment defined in `vite.config.ts`, so they do not need a real `.env`.
+Tests cover the login flow and error mapping, role routing, JWT claim reading, the session client, the API client error table, forced sign-out, the AuthProvider (reload, `/auth/me`, interrupted logout), the logout flow, the revocation scenario (AC-19), and the login and panel screens. Tests use a fixed test environment defined in `vite.config.ts`, so they do not need a real `.env`.
 
 ## Conventions
 
@@ -147,4 +216,5 @@ Tests cover the login flow and error mapping, role routing, JWT claim reading, t
 
 - Login, role-based routing, and the rescuer rejection are implemented.
 - Backend session registration uses the OSP-60 endpoint (`real` mode by default).
+- Session handling (AuthProvider, API client, logout with `/auth/logout`) is implemented (OSP-70). `GET /api/v1/auth/me` needs the backend `OSP-70` branch.
 - Panels are placeholders. Map, records, and admin features come in later tickets.
