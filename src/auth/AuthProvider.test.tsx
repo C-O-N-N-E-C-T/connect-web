@@ -161,6 +161,40 @@ describe('AuthProvider: GET /auth/me', () => {
     await waitFor(() => expect(deps.forceSignOut).toHaveBeenCalledWith('ROLE_NOT_ALLOWED', session.access_token));
   });
 
+  it("ignores a stale /auth/me answer for another user (no ROLE_NOT_ALLOWED sign-out of B, R2)", async () => {
+    let answer!: (value: Awaited<ReturnType<AuthProviderDeps['fetchMe']>>) => void;
+    const { deps, emit } = makeAuthDeps();
+    deps.getSession.mockResolvedValue(sessionFor('coordinator', 'user-a'));
+    deps.fetchMe.mockReturnValue(new Promise((resolve) => (answer = resolve)));
+    renderApp(deps);
+    await waitFor(() => expect(deps.fetchMe).toHaveBeenCalledOnce());
+
+    // A signs out, B signs in, then A's answer (A was demoted to rescuer) arrives.
+    act(() => emit('SIGNED_OUT', null));
+    act(() => emit('SIGNED_IN', sessionFor('coordinator', 'user-b')));
+    await act(async () =>
+      answer({ ok: true, status: 200, data: { user_id: 'user-a', role: 'rescuer', device_id: 'd' } }),
+    );
+
+    expect(deps.forceSignOut).not.toHaveBeenCalled();
+    expect(probe()).toBe('signedIn|coordinator|/login'); // B is still signed in
+  });
+
+  it('ignores an /auth/me answer that belongs to an earlier sign-in of the same user (R2)', async () => {
+    let answer!: (value: Awaited<ReturnType<AuthProviderDeps['fetchMe']>>) => void;
+    const { deps, emit } = makeAuthDeps();
+    deps.getSession.mockResolvedValue(sessionFor('coordinator', 'user-1', '', 'sess-old'));
+    deps.fetchMe.mockReturnValue(new Promise((resolve) => (answer = resolve)));
+    renderApp(deps);
+    await waitFor(() => expect(deps.fetchMe).toHaveBeenCalledOnce());
+
+    act(() => emit('SIGNED_IN', sessionFor('coordinator', 'user-1', '', 'sess-new')));
+    await act(async () =>
+      answer({ ok: true, status: 200, data: { user_id: 'user-1', role: 'rescuer', device_id: 'd' } }),
+    );
+    expect(deps.forceSignOut).not.toHaveBeenCalled();
+  });
+
   it('keeps the JWT role when /auth/me fails with a non-session error', async () => {
     const { deps } = makeAuthDeps();
     deps.getSession.mockResolvedValue(sessionFor('coordinator'));

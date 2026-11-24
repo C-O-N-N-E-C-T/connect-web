@@ -4,6 +4,7 @@
  * out, /login shows the reason. Real API client, forced sign-out, provider, guard and login page;
  * only Supabase and fetch are faked.
  */
+import { resetEndedSessions } from './endedSessions';
 import { StrictMode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, render, screen, waitFor } from '@testing-library/react';
@@ -30,6 +31,7 @@ function setVisible() {
 }
 
 beforeEach(() => {
+  resetEndedSessions();
   window.localStorage.clear();
   window.sessionStorage.clear();
 });

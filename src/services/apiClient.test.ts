@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createApiClient, type ApiClientDeps, type RefreshResult } from './apiClient';
+import { createApiClient, RECOVERY_TIMEOUT_MS, type ApiClientDeps, type RefreshResult } from './apiClient';
 
 const BASE = 'http://api.test';
 
@@ -25,7 +25,9 @@ function makeDeps(overrides: Partial<ApiClientDeps> = {}) {
     }),
     rebindSession: vi.fn<ApiClientDeps['rebindSession']>().mockResolvedValue({ ok: true }),
     forceSignOut: vi.fn<ApiClientDeps['forceSignOut']>().mockResolvedValue(undefined),
-    isLogoutPending: vi.fn(() => false),
+    isLogoutPending: vi.fn((_sessionKey: string) => false),
+    // Test tokens are not JWTs: "b-..." tokens belong to session B, all others to session A.
+    sessionKeyOf: (token: string) => (token.startsWith('b-') ? 'B' : 'A'),
   };
   Object.assign(deps, overrides);
   return {
@@ -288,15 +290,58 @@ describe('apiClient: 401 UNAUTHENTICATED', () => {
     expect(deps.forceSignOut).toHaveBeenCalledWith('DEVICE_REVOKED', 'tok-2');
   });
 
-  it('does not re-bind when the retry after a refresh answers SESSION_NOT_BOUND', async () => {
+});
+
+describe('apiClient: each recovery kind at most once per request (R9)', () => {
+  it('401 -> refresh -> retry -> SESSION_NOT_BOUND -> re-bind -> retry -> success', async () => {
     const { deps } = makeDeps();
     deps.fetchImpl
+      .mockResolvedValueOnce(errorResponse(401, 'UNAUTHENTICATED'))
+      .mockResolvedValueOnce(errorResponse(403, 'SESSION_NOT_BOUND'))
+      .mockResolvedValueOnce(jsonResponse(200, { fine: true }));
+    const result = await createApiClient(deps).request('/api/v1/x');
+    expect(result).toEqual({ ok: true, status: 200, data: { fine: true } });
+    expect(deps.refreshAccessToken).toHaveBeenCalledOnce();
+    expect(deps.rebindSession).toHaveBeenCalledOnce();
+    expect(deps.fetchImpl).toHaveBeenCalledTimes(3);
+    expect(deps.forceSignOut).not.toHaveBeenCalled();
+  });
+
+  it('SESSION_NOT_BOUND -> re-bind -> retry -> 401 -> refresh -> retry -> success', async () => {
+    const { deps } = makeDeps();
+    deps.fetchImpl
+      .mockResolvedValueOnce(errorResponse(403, 'SESSION_NOT_BOUND'))
+      .mockResolvedValueOnce(errorResponse(401, 'UNAUTHENTICATED'))
+      .mockResolvedValueOnce(jsonResponse(200, { fine: true }));
+    const result = await createApiClient(deps).request('/api/v1/x');
+    expect(result).toEqual({ ok: true, status: 200, data: { fine: true } });
+    expect(deps.rebindSession).toHaveBeenCalledOnce();
+    expect(deps.refreshAccessToken).toHaveBeenCalledOnce();
+    expect(deps.fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it('a second 401 after both recoveries is definitive (SESSION_EXPIRED), no third retry', async () => {
+    const { deps } = makeDeps();
+    deps.fetchImpl
+      .mockResolvedValueOnce(errorResponse(401, 'UNAUTHENTICATED'))
+      .mockResolvedValueOnce(errorResponse(403, 'SESSION_NOT_BOUND'))
+      .mockResolvedValueOnce(errorResponse(401, 'UNAUTHENTICATED'));
+    const result = await createApiClient(deps).request('/api/v1/x');
+    expect(result).toMatchObject({ ok: false, error: { kind: 'SIGNED_OUT', reason: 'SESSION_EXPIRED' } });
+    expect(deps.refreshAccessToken).toHaveBeenCalledOnce();
+    expect(deps.fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it('a second SESSION_NOT_BOUND after both recoveries is definitive, no third retry', async () => {
+    const { deps } = makeDeps();
+    deps.fetchImpl
+      .mockResolvedValueOnce(errorResponse(403, 'SESSION_NOT_BOUND'))
       .mockResolvedValueOnce(errorResponse(401, 'UNAUTHENTICATED'))
       .mockResolvedValueOnce(errorResponse(403, 'SESSION_NOT_BOUND'));
     const result = await createApiClient(deps).request('/api/v1/x');
     expect(result).toMatchObject({ ok: false, error: { kind: 'SIGNED_OUT', reason: 'SESSION_NOT_BOUND' } });
-    expect(deps.rebindSession).not.toHaveBeenCalled();
-    expect(deps.fetchImpl).toHaveBeenCalledTimes(2);
+    expect(deps.rebindSession).toHaveBeenCalledOnce();
+    expect(deps.fetchImpl).toHaveBeenCalledTimes(3);
   });
 });
 
@@ -355,7 +400,7 @@ describe('apiClient: 403', () => {
 
     expect(result).toEqual({ ok: true, status: 200, data: { fine: true } });
     expect(deps.rebindSession).toHaveBeenCalledOnce();
-    expect(deps.rebindSession).toHaveBeenCalledWith('tok-1');
+    expect(deps.rebindSession).toHaveBeenCalledWith('tok-1', expect.any(AbortSignal));
     expect(deps.forceSignOut).not.toHaveBeenCalled();
   });
 
@@ -481,15 +526,172 @@ describe('apiClient: 403', () => {
     expect(deps.fetchImpl).toHaveBeenCalledTimes(2);
   });
 
-  it('does not refresh when the retry after a re-bind answers 401', async () => {
+});
+
+describe('apiClient: recovery is bound to the session that sent the request (R2)', () => {
+  it('a late 401 after a deliberate logout does nothing (no refresh, no SESSION_EXPIRED banner)', async () => {
+    const ended = new Set<string>();
+    const { deps, setToken } = makeDeps({ isSessionEnded: (key) => ended.has(key) });
+    deps.fetchImpl.mockImplementationOnce(async () => {
+      ended.add('A'); // the user pressed logout meanwhile ...
+      setToken(null); // ... and the local session is gone
+      return errorResponse(401, 'UNAUTHENTICATED');
+    });
+    const result = await createApiClient(deps).request('/api/v1/x');
+    expect(result).toEqual({ ok: false, error: { kind: 'SESSION_CHANGED' } });
+    expect(deps.refreshAccessToken).not.toHaveBeenCalled();
+    expect(deps.forceSignOut).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['SESSION_NOT_BOUND', 'rebindSession'],
+    ['DEVICE_REVOKED', 'forceSignOut'],
+  ] as const)('a late 403 %s after a deliberate logout does nothing', async (code, untouched) => {
+    const ended = new Set<string>();
+    const { deps, setToken } = makeDeps({ isSessionEnded: (key) => ended.has(key) });
+    deps.fetchImpl.mockImplementationOnce(async () => {
+      ended.add('A');
+      setToken(null);
+      return errorResponse(403, code);
+    });
+    const result = await createApiClient(deps).request('/api/v1/x');
+    expect(result).toEqual({ ok: false, error: { kind: 'SESSION_CHANGED' } });
+    expect(deps[untouched]).not.toHaveBeenCalled();
+    expect(deps.forceSignOut).not.toHaveBeenCalled();
+  });
+
+  it.each(['UNAUTHENTICATED', 'SESSION_NOT_BOUND', 'DEVICE_REVOKED', 'ACCOUNT_DISABLED'])(
+    "a stale %s from user A while user B signs in leaves B untouched",
+    async (code) => {
+      const { deps, setToken } = makeDeps();
+      deps.fetchImpl.mockImplementationOnce(async () => {
+        setToken('b-1'); // A logged out, B signed in while A's request was in flight
+        return errorResponse(code === 'UNAUTHENTICATED' ? 401 : 403, code);
+      });
+      const result = await createApiClient(deps).request('/api/v1/x');
+      expect(result).toEqual({ ok: false, error: { kind: 'SESSION_CHANGED' } });
+      expect(deps.fetchImpl).toHaveBeenCalledOnce(); // never retried with B's token
+      expect(deps.refreshAccessToken).not.toHaveBeenCalled();
+      expect(deps.rebindSession).not.toHaveBeenCalled();
+      expect(deps.forceSignOut).not.toHaveBeenCalled();
+    },
+  );
+
+  it('ignores a refresh that produced a token of another session', async () => {
     const { deps } = makeDeps();
-    deps.fetchImpl
-      .mockResolvedValueOnce(errorResponse(403, 'SESSION_NOT_BOUND'))
-      .mockResolvedValueOnce(errorResponse(401, 'UNAUTHENTICATED'));
+    deps.refreshAccessToken.mockResolvedValueOnce({ ok: true, accessToken: 'b-1' });
+    deps.fetchImpl.mockImplementation(async () => errorResponse(401, 'UNAUTHENTICATED'));
+    const result = await createApiClient(deps).request('/api/v1/x');
+    expect(result).toEqual({ ok: false, error: { kind: 'SESSION_CHANGED' } });
+    expect(deps.fetchImpl).toHaveBeenCalledOnce();
+    expect(deps.forceSignOut).not.toHaveBeenCalled();
+  });
+
+  it('still signs out when the session vanished without a logout in this tab (D4a: no session to refresh)', async () => {
+    const { deps, setToken } = makeDeps();
+    deps.fetchImpl.mockImplementationOnce(async () => {
+      setToken(null); // e.g. supabase-js dropped a rejected session itself
+      return errorResponse(401, 'UNAUTHENTICATED');
+    });
     const result = await createApiClient(deps).request('/api/v1/x');
     expect(result).toMatchObject({ ok: false, error: { kind: 'SIGNED_OUT', reason: 'SESSION_EXPIRED' } });
-    expect(deps.refreshAccessToken).not.toHaveBeenCalled();
-    expect(deps.fetchImpl).toHaveBeenCalledTimes(2);
+    expect(deps.forceSignOut).toHaveBeenCalledWith('SESSION_EXPIRED', 'tok-1');
+  });
+
+  it("a pending logout of session A does not disable recovery for session B", async () => {
+    const { deps, setToken } = makeDeps({ isLogoutPending: vi.fn((key: string) => key === 'A') });
+    setToken('b-1');
+    deps.refreshAccessToken.mockImplementationOnce(async () => {
+      setToken('b-2');
+      return { ok: true, accessToken: 'b-2' };
+    });
+    deps.fetchImpl
+      .mockResolvedValueOnce(errorResponse(401, 'UNAUTHENTICATED'))
+      .mockResolvedValueOnce(jsonResponse(200, {}));
+    const result = await createApiClient(deps).request('/api/v1/x');
+    expect(result.ok).toBe(true);
+    expect(deps.isLogoutPending).toHaveBeenCalledWith('B');
+  });
+});
+
+describe('apiClient: multi-tab refresh races (R7)', () => {
+  it('uses a newer token of the same session when the refresh was rejected as already used', async () => {
+    const { deps, setToken } = makeDeps();
+    deps.refreshAccessToken.mockImplementationOnce(async () => {
+      setToken('tok-other-tab'); // another tab rotated the session; storage holds the new one
+      return { ok: false, definitive: true };
+    });
+    deps.fetchImpl
+      .mockResolvedValueOnce(errorResponse(401, 'UNAUTHENTICATED'))
+      .mockResolvedValueOnce(jsonResponse(200, { fine: true }));
+    const result = await createApiClient(deps).request('/api/v1/x');
+    expect(result).toEqual({ ok: true, status: 200, data: { fine: true } });
+    expect(authHeaderOf(deps.fetchImpl.mock.calls[1])).toBe('Bearer tok-other-tab');
+    expect(deps.forceSignOut).not.toHaveBeenCalled();
+  });
+
+  it('uses a newer token of the same session after a discarded (transient) refresh', async () => {
+    const { deps, setToken } = makeDeps();
+    deps.refreshAccessToken.mockImplementationOnce(async () => {
+      setToken('tok-other-tab');
+      return { ok: false, definitive: false, kind: 'NETWORK_ERROR' };
+    });
+    deps.fetchImpl
+      .mockResolvedValueOnce(errorResponse(401, 'UNAUTHENTICATED'))
+      .mockResolvedValueOnce(jsonResponse(200, {}));
+    expect((await createApiClient(deps).request('/api/v1/x')).ok).toBe(true);
+  });
+});
+
+describe('apiClient: a hung refresh / re-bind does not block later requests (R8)', () => {
+  it('a later request starts a new refresh after the hung one hit its bound', async () => {
+    vi.useFakeTimers();
+    const { deps } = makeDeps();
+    deps.refreshAccessToken.mockImplementationOnce(() => new Promise(() => undefined));
+    deps.fetchImpl.mockImplementation(async (_url, init) => {
+      const auth = (init?.headers as Record<string, string>).Authorization;
+      return auth === 'Bearer tok-2' ? jsonResponse(200, {}) : errorResponse(401, 'UNAUTHENTICATED');
+    });
+    const client = createApiClient(deps);
+
+    const first = client.request('/api/v1/x', { timeoutMs: 60_000 });
+    await vi.advanceTimersByTimeAsync(RECOVERY_TIMEOUT_MS);
+    expect(await first).toEqual({ ok: false, error: { kind: 'TIMEOUT' } });
+
+    const second = client.request('/api/v1/x', { timeoutMs: 60_000 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect((await second).ok).toBe(true);
+    expect(deps.refreshAccessToken).toHaveBeenCalledTimes(2);
+    expect(deps.forceSignOut).not.toHaveBeenCalled();
+  });
+
+  it('aborts a hung re-bind at its bound and re-binds again on the next request', async () => {
+    vi.useFakeTimers();
+    let bound = false;
+    const signals: AbortSignal[] = [];
+    const { deps } = makeDeps();
+    deps.rebindSession.mockImplementationOnce((_token, signal) => {
+      signals.push(signal);
+      return new Promise(() => undefined);
+    });
+    deps.rebindSession.mockImplementation(async () => {
+      bound = true;
+      return { ok: true };
+    });
+    deps.fetchImpl.mockImplementation(async () =>
+      bound ? jsonResponse(200, {}) : errorResponse(403, 'SESSION_NOT_BOUND'),
+    );
+    const client = createApiClient(deps);
+
+    const first = client.request('/api/v1/x', { timeoutMs: 60_000 });
+    await vi.advanceTimersByTimeAsync(RECOVERY_TIMEOUT_MS);
+    expect(await first).toEqual({ ok: false, error: { kind: 'TIMEOUT' } });
+    expect(signals[0].aborted).toBe(true);
+
+    const second = client.request('/api/v1/x', { timeoutMs: 60_000 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect((await second).ok).toBe(true);
+    expect(deps.rebindSession).toHaveBeenCalledTimes(2);
   });
 });
 

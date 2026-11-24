@@ -59,6 +59,8 @@ describe('AppLayout logout button (D1/D2)', () => {
     expect(deps.signOut).toHaveBeenCalledOnce();
     expect(window.localStorage.getItem(LOGOUT_PENDING_KEY)).toBeNull();
     expect(deps.forceSignOut).not.toHaveBeenCalled();
+    // Late responses of this session are ignored from now on (R2).
+    expect(deps.markSessionEnded).toHaveBeenCalledWith('sess-user-1');
   });
 
   it('still signs out and reaches /login when the backend call fails', async () => {

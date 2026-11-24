@@ -37,7 +37,7 @@ const KNOWN_CODES: ReadonlySet<string> = new Set([
 export async function registerBrowserSession(
   input: RegisterSessionInput,
   accessToken: string,
-  options: { mode?: string; apiBaseUrl?: string; fetchImpl?: FetchLike } = {},
+  options: { mode?: string; apiBaseUrl?: string; fetchImpl?: FetchLike; signal?: AbortSignal } = {},
 ): Promise<RegisterSessionResult> {
   const mode = options.mode ?? import.meta.env.VITE_AUTH_SESSION_MODE;
   if (mode === 'mock') {
@@ -56,6 +56,7 @@ export async function registerBrowserSession(
         Authorization: `Bearer ${accessToken}`,
       },
       body: JSON.stringify({ device_id: input.deviceId, device_name: input.deviceName }),
+      signal: options.signal,
     });
   } catch {
     return { ok: false, code: 'NETWORK_ERROR' };

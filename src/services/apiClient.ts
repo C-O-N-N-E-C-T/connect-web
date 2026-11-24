@@ -6,22 +6,31 @@
  *
  * | Response                | Action                                                            |
  * |-------------------------|-------------------------------------------------------------------|
- * | 401                     | single-flight token refresh, retry ONCE. Refresh definitively     |
- * |                         | rejected or retry still 401 -> forced sign-out (SESSION_EXPIRED)  |
+ * | 401                     | single-flight token refresh, then retry. Refresh definitively     |
+ * |                         | rejected (or no session to refresh) -> forced sign-out            |
+ * |                         | (SESSION_EXPIRED)                                                 |
  * | 403 DEVICE_REVOKED      | forced sign-out with that reason                                  |
  * | 403 ACCOUNT_DISABLED    | forced sign-out with that reason                                  |
- * | 403 SESSION_NOT_BOUND   | single-flight re-bind (POST /auth/session), retry ONCE. Re-bind   |
- * |                         | DEVICE_REVOKED / ACCOUNT_DISABLED / 401, or retry still           |
- * |                         | SESSION_NOT_BOUND -> forced sign-out                              |
+ * | 403 SESSION_NOT_BOUND   | single-flight re-bind (POST /auth/session), then retry. Re-bind   |
+ * |                         | DEVICE_REVOKED / ACCOUNT_DISABLED -> sign-out with that reason;   |
+ * |                         | re-bind 401 -> sign-out (SESSION_EXPIRED)                         |
  * | 403 ROLE_FORBIDDEN      | typed error, NO sign-out                                          |
  * | 429/5xx/network/timeout | typed error, NO sign-out                                          |
  *
- * D4a: sign out ONLY on a definitive rejection. A transient failure DURING refresh or re-bind
- * (network, 5xx, 429, timeout) returns a typed error without sign-out and without a further retry;
- * the next request simply tries again (no failure is cached). Scenario: the crisis centre's
- * internet drops for 2 s exactly when the token is refreshed -> the coordinator stays signed in.
+ * R9: each recovery KIND at most once per request (one refresh, one re-bind; at most two retries,
+ * no loops). A second 401 -> SESSION_EXPIRED, a second SESSION_NOT_BOUND -> SESSION_NOT_BOUND.
  *
- * At most one retry per request; after the retry no further refresh or re-bind is attempted.
+ * D4a: sign out ONLY on a definitive rejection. A transient failure DURING refresh or re-bind
+ * (network, 5xx, 429, timeout) returns a typed error without sign-out and without a further retry.
+ * Scenario: the crisis centre's internet drops for 2 s exactly when the token is refreshed -> the
+ * coordinator stays signed in. (supabase-js itself then serves the same refresh failure for up to
+ * 60 s, so requests may keep failing that long; nobody is signed out. See README, review R3.)
+ *
+ * R2: recovery and forced sign-out are bound to the session that SENT the request (JWT
+ * `session_id`). If that session ended in this tab (logout) or another session is current (a new
+ * sign-in), nothing is refreshed, re-bound or signed out: the result is SESSION_CHANGED.
+ * R7: after a failed refresh, a newer token of the same session in storage (rotated by another
+ * tab) is used instead. R8: each refresh / re-bind attempt is bounded by RECOVERY_TIMEOUT_MS.
  *
  * `recovery: false` (used by POST /auth/logout) disables refresh, re-bind, retry AND forced
  * sign-out: every outcome is returned as a typed error. The same applies to every request while a
@@ -33,6 +42,7 @@
 import type { ForcedSignOutReason } from '../auth/forcedSignOut';
 import type { RegisterSessionResult } from './authSessionClient';
 import { TIMED_OUT, withDeadline } from '../lib/deadline';
+import { readSessionKey } from '../lib/jwt';
 
 export const DEFAULT_TIMEOUT_MS = 15_000;
 
@@ -55,7 +65,12 @@ export type ApiErrorKind =
   /** Any other non-2xx status. */
   | 'HTTP_ERROR'
   /** 2xx with a body that is not JSON. */
-  | 'INVALID_RESPONSE';
+  | 'INVALID_RESPONSE'
+  /**
+   * The session that sent the request ended or was replaced meanwhile (logout, another sign-in):
+   * nothing was refreshed, re-bound or signed out (review R2).
+   */
+  | 'SESSION_CHANGED';
 
 export interface ApiError {
   kind: ApiErrorKind;
@@ -84,7 +99,7 @@ export interface ApiRequestOptions {
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
 /** Transient failure kinds of a refresh / re-bind (D4a): never a reason to sign out. */
-export type TransientKind = 'NETWORK_ERROR' | 'SERVER_ERROR' | 'RATE_LIMITED';
+export type TransientKind = 'NETWORK_ERROR' | 'SERVER_ERROR' | 'RATE_LIMITED' | 'TIMEOUT';
 
 /**
  * Outcome of a Supabase session refresh. `definitive` = the refresh token was rejected (4xx auth
@@ -110,10 +125,15 @@ export interface ApiClientDeps {
   getAccessToken(): Promise<TokenLookup>;
   /** Refreshes the Supabase session and classifies a failure (see RefreshResult). */
   refreshAccessToken(): Promise<RefreshResult>;
-  /** POST /api/v1/auth/session for this browser (existing OSP-60 client). */
-  rebindSession(accessToken: string): Promise<RegisterSessionResult>;
+  /** POST /api/v1/auth/session for this browser (existing OSP-60 client), abortable. */
+  rebindSession(accessToken: string, signal: AbortSignal): Promise<RegisterSessionResult>;
   forceSignOut(reason: ForcedSignOutReason, accessToken: string | null): Promise<void>;
-  isLogoutPending(): boolean;
+  /** True while a logout of the session with this identity is pending (R6: flag is per session). */
+  isLogoutPending(sessionKey: string): boolean;
+  /** Identity of the session a token belongs to. Default: JWT `session_id`, else `sub`, else token. */
+  sessionKeyOf?(token: string): string;
+  /** True if this tab ended that session on purpose (logout or forced sign-out). Default: never. */
+  isSessionEnded?(sessionKey: string): boolean;
 }
 
 export interface ApiClient {
@@ -125,67 +145,142 @@ type Attempt =
   | { type: 'network' }
   | { type: 'timeout' };
 
+/** Result of a refresh or re-bind, already checked against the session that sent the request. */
+type Recovery =
+  | { ok: true; accessToken: string }
+  | { ok: false; stale: true }
+  | { ok: false; signOut: ForcedSignOutReason }
+  | { ok: false; error: ApiError };
+
 type RebindOutcome =
   | { ok: true }
   | { ok: false; signOut: ForcedSignOutReason }
   | { ok: false; error: ApiError };
 
+/** What the current session is, relative to the session that sent a request. */
+type Current =
+  | { state: 'same'; token: string }
+  | { state: 'none' }
+  | { state: 'other' }
+  | { state: 'unknown'; error: ApiError };
+
 const TRANSIENT_NETWORK: RefreshResult = { ok: false, definitive: false, kind: 'NETWORK_ERROR' };
+const STALE: Recovery = { ok: false, stale: true };
+const sessionChanged = (): ApiResult<never> => ({ ok: false, error: { kind: 'SESSION_CHANGED' } });
+
+/** Upper bound of one refresh / re-bind attempt, so a hung one cannot hold the shared slot (R8). */
+export const RECOVERY_TIMEOUT_MS = 10_000;
 
 export function createApiClient(deps: ApiClientDeps): ApiClient {
-  // Single-flight: concurrent callers share one attempt. The slot is cleared when the attempt
-  // settles, so a (transient) failure is never cached and the next request tries again.
-  let refreshInFlight: Promise<RefreshResult> | null = null;
-  let rebindInFlight: Promise<RebindOutcome> | null = null;
+  const keyOf = deps.sessionKeyOf ?? ((token: string) => readSessionKey(token) ?? token);
+  const isEnded = deps.isSessionEnded ?? (() => false);
 
-  function refreshOnce(): Promise<RefreshResult> {
-    if (!refreshInFlight) {
-      refreshInFlight = deps
-        .refreshAccessToken()
-        .catch((error: unknown) => {
+  // Single-flight per session: concurrent callers of the SAME session share one attempt. The slot
+  // is cleared when the attempt settles; every attempt is bounded by RECOVERY_TIMEOUT_MS (R8), so
+  // a hung one cannot keep it. A failure is never cached by this client (see README for the SDK's
+  // own 60 s refresh-failure cooldown, R3).
+  let refreshFlight: { owner: string; promise: Promise<Recovery> } | null = null;
+  let rebindFlight: { owner: string; promise: Promise<RebindOutcome> } | null = null;
+
+  async function currentFor(owner: string): Promise<Current> {
+    const lookup = await deps.getAccessToken().catch((error: unknown): TokenLookup => {
+      reportUnexpected('getAccessToken', error);
+      return { ok: false, kind: 'NETWORK_ERROR' };
+    });
+    if (!lookup.ok) return { state: 'unknown', error: transientError(lookup.kind, lookup.status) };
+    if (!lookup.accessToken) return { state: 'none' };
+    return keyOf(lookup.accessToken) === owner
+      ? { state: 'same', token: lookup.accessToken }
+      : { state: 'other' };
+  }
+
+  async function boundedCurrent(owner: string, ms: number): Promise<Current> {
+    const current = await withDeadline(currentFor(owner), ms);
+    return current === TIMED_OUT ? { state: 'unknown', error: { kind: 'TIMEOUT' } } : current;
+  }
+
+  function refreshFor(owner: string, sentToken: string): Promise<Recovery> {
+    if (refreshFlight && refreshFlight.owner === owner) return refreshFlight.promise;
+    const promise = (async (): Promise<Recovery> => {
+      const result = await withDeadline(
+        deps.refreshAccessToken().catch((error: unknown) => {
           reportUnexpected('refreshAccessToken', error);
           return TRANSIENT_NETWORK;
-        })
-        .finally(() => {
-          refreshInFlight = null;
-        });
-    }
-    return refreshInFlight;
+        }),
+        RECOVERY_TIMEOUT_MS,
+      );
+      if (result !== TIMED_OUT && result.ok) {
+        return keyOf(result.accessToken) === owner ? result : STALE;
+      }
+      // R7: another tab may have rotated the session meanwhile (refresh_token_already_used, or a
+      // refresh discarded because storage changed). If storage now holds a newer token of the
+      // same session, use it instead of failing or signing out.
+      const current = await boundedCurrent(owner, RECOVERY_TIMEOUT_MS);
+      if (current.state === 'same' && current.token !== sentToken) {
+        return { ok: true, accessToken: current.token };
+      }
+      if (current.state === 'other') return STALE;
+      if (result === TIMED_OUT) return { ok: false, error: { kind: 'TIMEOUT' } };
+      if (result.definitive) return { ok: false, signOut: 'SESSION_EXPIRED' };
+      // D4a: transient -> typed error, stay signed in.
+      return { ok: false, error: transientError(result.kind, result.status) };
+    })();
+    const flight = { owner, promise };
+    refreshFlight = flight;
+    void promise.finally(() => {
+      if (refreshFlight === flight) refreshFlight = null;
+    });
+    return promise;
   }
 
-  /**
-   * A token that differs from the one we sent means another request (or the SDK's auto-refresh)
-   * already refreshed the session; use it instead of refreshing again.
-   */
-  async function freshTokenAfter401(usedToken: string): Promise<RefreshResult> {
-    const current = await currentToken();
-    if (current && current !== usedToken) return { ok: true, accessToken: current };
-    return refreshOnce();
+  function rebindFor(owner: string, token: string): Promise<RebindOutcome> {
+    if (rebindFlight && rebindFlight.owner === owner) return rebindFlight.promise;
+    const promise = (async (): Promise<RebindOutcome> => {
+      const controller = new AbortController();
+      const result = await withDeadline(
+        deps.rebindSession(token, controller.signal).catch((error: unknown) => {
+          reportUnexpected('rebindSession', error);
+          return { ok: false, code: 'NETWORK_ERROR' } as RegisterSessionResult;
+        }),
+        RECOVERY_TIMEOUT_MS,
+      );
+      if (result === TIMED_OUT) {
+        controller.abort();
+        return { ok: false, error: { kind: 'TIMEOUT' } };
+      }
+      return classifyRebind(result);
+    })();
+    const flight = { owner, promise };
+    rebindFlight = flight;
+    void promise.finally(() => {
+      if (rebindFlight === flight) rebindFlight = null;
+    });
+    return promise;
   }
 
-  /** Current token, or null when signed out or unreadable. */
-  async function currentToken(): Promise<string | null> {
-    const lookup = await deps.getAccessToken().catch(() => null);
-    return lookup && lookup.ok ? lookup.accessToken : null;
+  /** 401: use a newer token of the same session, else refresh (shared per session). */
+  async function recoverFrom401(owner: string, sentToken: string, ms: number): Promise<Recovery> {
+    const current = await boundedCurrent(owner, ms);
+    if (current.state === 'unknown') return { ok: false, error: current.error };
+    if (current.state === 'other') return STALE;
+    // No session at all: ended on purpose in this tab -> stale; otherwise "no session to
+    // refresh", which D4a counts as definitive.
+    if (current.state === 'none') return isEnded(owner) ? STALE : { ok: false, signOut: 'SESSION_EXPIRED' };
+    if (current.token !== sentToken) return { ok: true, accessToken: current.token };
+    return refreshFor(owner, sentToken);
   }
 
-  function rebindOnce(): Promise<RebindOutcome> {
-    if (!rebindInFlight) {
-      rebindInFlight = (async (): Promise<RebindOutcome> => {
-        const token = await currentToken();
-        if (!token) return { ok: false, signOut: 'SESSION_EXPIRED' }; // no session to bind
-        let result: RegisterSessionResult;
-        try {
-          result = await deps.rebindSession(token);
-        } catch {
-          return { ok: false, error: { kind: 'NETWORK_ERROR' } };
-        }
-        return classifyRebind(result);
-      })().finally(() => {
-        rebindInFlight = null;
-      });
-    }
-    return rebindInFlight;
+  /** 403 SESSION_NOT_BOUND: re-bind the SAME session (shared per session), then use its token. */
+  async function recoverFromNotBound(owner: string, ms: number): Promise<Recovery> {
+    const current = await boundedCurrent(owner, ms);
+    if (current.state === 'unknown') return { ok: false, error: current.error };
+    if (current.state === 'other') return STALE;
+    if (current.state === 'none') return isEnded(owner) ? STALE : { ok: false, signOut: 'SESSION_EXPIRED' };
+    const outcome = await rebindFor(owner, current.token);
+    if (!outcome.ok) return outcome;
+    const after = await boundedCurrent(owner, ms);
+    if (after.state === 'other' || after.state === 'none') return STALE;
+    return { ok: true, accessToken: after.state === 'same' ? after.token : current.token };
   }
 
   async function send(
@@ -220,26 +315,14 @@ export function createApiClient(deps: ApiClientDeps): ApiClient {
     }
   }
 
-  async function forced(
-    reason: ForcedSignOutReason,
-    usedToken: string,
-    attempt: Attempt,
-  ): Promise<ApiResult<never>> {
-    // A logout may have started while this request was in flight: never sign out "for" it.
-    if (deps.isLogoutPending()) return toResult(attempt) as ApiResult<never>;
-    await deps.forceSignOut(reason, usedToken);
-    return { ok: false, error: { kind: 'SIGNED_OUT', reason, ...statusOf(attempt) } };
-  }
-
   async function request<T>(path: string, options: ApiRequestOptions = {}): Promise<ApiResult<T>> {
     // Only relative API paths: the bearer token must never be sent to another origin.
     // A backslash is rejected too: URL parsing treats "/\\host" like "//host" (review R15).
     if (!path.startsWith('/') || path.startsWith('//') || path.includes('\\')) {
       throw new Error(`apiClient: path must start with a single "/" and contain no "\\": ${path}`);
     }
-    const recoveryAllowed = () => options.recovery !== false && !deps.isLogoutPending();
     // One deadline for the whole request: getSession() / refreshSession() can themselves hang
-    // (offline with an expired token, contended auth lock), and the logout must never get stuck.
+    // (offline with an expired token), and the logout must never get stuck.
     const deadlineAt = Date.now() + (options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     const remaining = () => deadlineAt - Date.now();
     const TIMEOUT: ApiResult<never> = { ok: false, error: { kind: 'TIMEOUT' } };
@@ -253,51 +336,64 @@ export function createApiClient(deps: ApiClientDeps): ApiClient {
     );
     if (lookup === TIMED_OUT) return TIMEOUT;
     if (!lookup.ok) return { ok: false, error: transientError(lookup.kind, lookup.status) };
-    const token = lookup.accessToken;
-    if (!token) return { ok: false, error: { kind: 'UNAUTHENTICATED' } };
+    if (!lookup.accessToken) return { ok: false, error: { kind: 'UNAUTHENTICATED' } };
 
-    const first = await send(path, token, options, remaining());
-    if (first.type !== 'response' || !recoveryAllowed()) return toResult<T>(first);
+    // R2: every recovery step and every forced sign-out is bound to the session that SENT the
+    // request. A stale response (after a logout, or while another user signs in) does nothing.
+    const owner = keyOf(lookup.accessToken);
+    const recoveryAllowed = () => options.recovery !== false && !deps.isLogoutPending(owner);
 
-    let retryToken: string;
-    if (first.status === 401) {
-      const fresh = await withDeadline(freshTokenAfter401(token), remaining());
-      if (fresh === TIMED_OUT) return TIMEOUT;
-      if (!recoveryAllowed()) return toResult<T>(first);
-      if (!fresh.ok) {
-        if (fresh.definitive) return forced('SESSION_EXPIRED', token, first);
-        // D4a: transient refresh failure -> typed error, stay signed in, no retry.
-        return { ok: false, error: transientError(fresh.kind, fresh.status) };
-      }
-      retryToken = fresh.accessToken;
-    } else if (first.status === 403 && first.errorCode === 'SESSION_NOT_BOUND') {
-      const rebind = await withDeadline(rebindOnce(), remaining());
-      if (rebind === TIMED_OUT) return TIMEOUT;
-      if (!recoveryAllowed()) return toResult<T>(first);
-      if (!rebind.ok) {
-        if ('signOut' in rebind) return forced(rebind.signOut, token, first);
-        // D4a: transient re-bind failure -> typed error, stay signed in, no retry.
-        return { ok: false, error: rebind.error };
-      }
-      const current = await withDeadline(currentToken(), remaining());
-      if (current === TIMED_OUT) return TIMEOUT;
-      retryToken = current ?? token;
-    } else {
-      const terminal = terminalReason(first);
-      if (terminal) return forced(terminal, token, first);
-      return toResult<T>(first);
+    /** Forced sign-out, unless the request's session is no longer the one to sign out. */
+    async function forced(reason: ForcedSignOutReason, token: string, attempt: Attempt): Promise<ApiResult<T>> {
+      if (!recoveryAllowed()) return toResult<T>(attempt);
+      if (isEnded(owner)) return sessionChanged();
+      const current = await boundedCurrent(owner, Math.max(remaining(), 1_000));
+      if (current.state === 'other') return sessionChanged();
+      // 'none' (session already gone, not by this tab's logout) and 'unknown' still sign out: the
+      // backend's verdict is definitive and no other session is affected.
+      if (!recoveryAllowed() || isEnded(owner)) return sessionChanged();
+      await deps.forceSignOut(reason, token);
+      return { ok: false, error: { kind: 'SIGNED_OUT', reason, ...statusOf(attempt) } };
     }
 
-    // The single retry. Whatever happens now, no further refresh / re-bind.
-    const second = await send(path, retryToken, options, remaining());
-    if (second.type !== 'response' || !recoveryAllowed()) return toResult<T>(second);
-    if (second.status === 401) return forced('SESSION_EXPIRED', retryToken, second);
-    if (second.status === 403 && second.errorCode === 'SESSION_NOT_BOUND') {
-      return forced('SESSION_NOT_BOUND', retryToken, second);
+    function fromRecovery(recovery: Exclude<Recovery, { ok: true }>, token: string, attempt: Attempt) {
+      if ('stale' in recovery) return Promise.resolve(sessionChanged() as ApiResult<T>);
+      if ('signOut' in recovery) return forced(recovery.signOut, token, attempt);
+      // D4a: transient failure during refresh / re-bind -> typed error, no sign-out, no retry.
+      return Promise.resolve({ ok: false, error: recovery.error } as ApiResult<T>);
     }
-    const terminal = terminalReason(second);
-    if (terminal) return forced(terminal, retryToken, second);
-    return toResult<T>(second);
+
+    let token = lookup.accessToken;
+    let refreshed = false;
+    let rebound = false;
+    let attempt = await send(path, token, options, remaining());
+
+    // R9: each recovery KIND at most once per request (one refresh, one re-bind), so at most two
+    // retries in total and no loops. A second 401 / second SESSION_NOT_BOUND is definitive.
+    for (;;) {
+      if (attempt.type !== 'response' || !recoveryAllowed()) return toResult<T>(attempt);
+
+      let recovery: Recovery | typeof TIMED_OUT;
+      if (attempt.status === 401) {
+        if (refreshed) return forced('SESSION_EXPIRED', token, attempt);
+        refreshed = true;
+        recovery = await withDeadline(recoverFrom401(owner, token, remaining()), remaining());
+      } else if (attempt.status === 403 && attempt.errorCode === 'SESSION_NOT_BOUND') {
+        if (rebound) return forced('SESSION_NOT_BOUND', token, attempt);
+        rebound = true;
+        recovery = await withDeadline(recoverFromNotBound(owner, remaining()), remaining());
+      } else {
+        const terminal = terminalReason(attempt);
+        if (terminal) return forced(terminal, token, attempt);
+        return toResult<T>(attempt);
+      }
+
+      if (recovery === TIMED_OUT) return TIMEOUT;
+      if (!recoveryAllowed()) return toResult<T>(attempt);
+      if (!recovery.ok) return fromRecovery(recovery, token, attempt);
+      token = recovery.accessToken;
+      attempt = await send(path, token, options, remaining());
+    }
   }
 
   return { request };

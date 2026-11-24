@@ -2,6 +2,7 @@
  * The app wiring with Supabase and fetch faked: checks that every sign-out uses scope 'local',
  * that a forced sign-out never calls /auth/logout, and that logout runs without recovery.
  */
+import { resetEndedSessions } from './endedSessions';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AuthApiError, AuthRetryableFetchError } from '@supabase/supabase-js';
 import { SIGNOUT_REASON_KEY } from './forcedSignOut';
@@ -46,6 +47,7 @@ function urlsCalled(): string[] {
 }
 
 beforeEach(() => {
+  resetEndedSessions();
   vi.clearAllMocks();
   window.sessionStorage.clear();
   window.localStorage.clear();
@@ -145,6 +147,23 @@ describe('authRuntime', () => {
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(mocks.signOut).toHaveBeenCalledWith({ scope: 'local' });
     expect(window.sessionStorage.getItem(SIGNOUT_REASON_KEY)).toBe('SESSION_EXPIRED');
+  });
+
+  it('a late 401 after a deliberate logout shows no SESSION_EXPIRED banner (R2)', async () => {
+    const token = tokenFor({ sub: 'u', session_id: 'sess-logged-out' });
+    mocks.getSession.mockResolvedValueOnce(sessionWith(token)); // when the request was sent
+    mocks.getSession.mockResolvedValue({ data: { session: null }, error: null }); // after logout
+    fetchMock.mockImplementation(async () => {
+      defaultAuthDeps.markSessionEnded('sess-logged-out'); // logout pressed meanwhile
+      return json(401, { error_code: 'UNAUTHENTICATED', message: 'x' });
+    });
+
+    const result = await apiClient.request('/api/v1/auth/me');
+
+    expect(result).toEqual({ ok: false, error: { kind: 'SESSION_CHANGED' } });
+    expect(mocks.refreshSession).not.toHaveBeenCalled();
+    expect(mocks.signOut).not.toHaveBeenCalled();
+    expect(window.sessionStorage.getItem(SIGNOUT_REASON_KEY)).toBeNull();
   });
 
   it('wires the auth subscription and its unsubscribe', () => {

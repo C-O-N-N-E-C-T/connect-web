@@ -16,6 +16,7 @@ import { createApiClient } from '../services/apiClient';
 import { registerBrowserSession } from '../services/authSessionClient';
 import { getOrCreateDeviceId } from '../services/deviceId';
 import { createForcedSignOut } from './forcedSignOut';
+import { isSessionEnded, markSessionEnded } from './endedSessions';
 import { isLogoutPending, SIGN_OUT_TIMEOUT_MS } from './logout';
 import { classifyRefresh } from './refreshResult';
 import type { AuthProviderDeps } from './AuthProvider';
@@ -94,12 +95,14 @@ export const apiClient = createApiClient({
     return { ok: false, kind: result.kind, ...(result.status !== undefined ? { status: result.status } : {}) };
   },
   refreshAccessToken: async () => classifyRefresh(await supabase.auth.refreshSession()),
-  rebindSession: (accessToken) =>
+  rebindSession: (accessToken, signal) =>
     registerBrowserSession(
       { deviceId: getOrCreateDeviceId(), deviceName: navigator.userAgent.slice(0, 100) },
       accessToken,
+      { signal },
     ),
   forceSignOut,
+  isSessionEnded,
   isLogoutPending: () => isLogoutPending(),
 });
 
@@ -111,6 +114,7 @@ export interface AuthMeResponse {
 }
 
 export const defaultAuthDeps: AuthProviderDeps = {
+  markSessionEnded,
   getSession: async () => {
     const { data } = await supabase.auth.getSession();
     return data.session;

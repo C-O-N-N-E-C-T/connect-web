@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { resetEndedSessions } from './endedSessions';
 import {
   clearSignOutReason,
   createForcedSignOut,
@@ -8,6 +9,7 @@ import {
 } from './forcedSignOut';
 
 beforeEach(() => {
+  resetEndedSessions();
   window.sessionStorage.clear();
 });
 

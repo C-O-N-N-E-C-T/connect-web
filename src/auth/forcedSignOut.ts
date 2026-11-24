@@ -13,6 +13,8 @@
  * This path never calls POST /auth/logout: the token has already been rejected by the backend.
  */
 import { withDeadline } from '../lib/deadline';
+import { readSessionKey } from '../lib/jwt';
+import { isSessionEnded, markSessionEnded } from './endedSessions';
 import { storageGet, storageRemove, storageSet } from '../lib/storage';
 
 export type ForcedSignOutReason =
@@ -81,22 +83,22 @@ export type ForceSignOut = (reason: ForcedSignOutReason, accessToken: string | n
  * Returns a single-flight forced sign-out.
  *
  * - Concurrent calls share one sign-out: one navigation, one message (the first reason wins).
- * - A late call for a token that was already signed out (a response that arrived after the
- *   sign-out finished) is ignored, so it cannot overwrite the message or navigate again.
+ * - A late call for a session that was already ended (a response that arrived after the
+ *   sign-out or a logout finished) is ignored, so it cannot overwrite the message or navigate.
  * - The in-flight latch is reset afterwards: the SPA does not reload between logins, so a later
  *   session must still be able to be signed out.
  */
 export function createForcedSignOut(deps: ForcedSignOutDeps): ForceSignOut {
   let inFlight: Promise<void> | null = null;
-  const handledTokens = new Set<string>();
 
   return function forceSignOut(reason, accessToken) {
     if (inFlight) return inFlight;
-    if (accessToken !== null && handledTokens.has(accessToken)) return Promise.resolve();
-    if (accessToken !== null) {
-      if (handledTokens.size >= 20) handledTokens.clear();
-      handledTokens.add(accessToken);
-    }
+    // Keyed by SESSION, not token: a late response carrying another token of the same, already
+    // ended session (e.g. a 401 after DEVICE_REVOKED, or anything after a logout) is ignored, so it
+    // cannot sign out again or replace the banner (review R2).
+    const sessionKey = accessToken === null ? null : (readSessionKey(accessToken) ?? accessToken);
+    if (sessionKey !== null && isSessionEnded(sessionKey)) return Promise.resolve();
+    markSessionEnded(sessionKey);
 
     inFlight = (async () => {
       try {

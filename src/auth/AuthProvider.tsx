@@ -10,7 +10,7 @@ import {
 } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import type { AuthChangeEvent, Session } from '@supabase/supabase-js';
-import { decodeJwtClaims, readUserRole } from '../lib/jwt';
+import { decodeJwtClaims, readSessionKey, readUserRole } from '../lib/jwt';
 import { isWebRole, type AppRole } from '../lib/roles';
 import type { ApiResult } from '../services/apiClient';
 import type { ForceSignOut } from './forcedSignOut';
@@ -54,6 +54,8 @@ export interface AuthProviderDeps {
   /** `signOut({ scope: 'local' })`, never throws. */
   signOut(): Promise<void>;
   forceSignOut: ForceSignOut;
+  /** Records that this tab ended a session on purpose (see endedSessions.ts). */
+  markSessionEnded(sessionKey: string | null): void;
   setLoginNavigator(navigateToLogin: () => void): () => void;
   /** localStorage (holds the logout-pending flag), or null when storage is blocked. */
   storage(): Storage | null;
@@ -93,6 +95,11 @@ function userIdOf(session: Session): string | null {
   } catch {
     return null;
   }
+}
+
+/** Identity of a session (JWT session_id, else the user id). */
+export function sessionKeyOf(session: Session): string | null {
+  return readSessionKey(session.access_token) ?? userIdOf(session);
 }
 
 const LOADING: AuthState = { status: 'loading', session: null, role: null };
@@ -159,6 +166,7 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
     if (d.mode === 'mock') return;
     if (meInFlightRef.current) return meInFlightRef.current;
     lastMeStartRef.current = d.now();
+    const startedFor = sessionRef.current ? sessionKeyOf(sessionRef.current) : null;
 
     const run = (async () => {
       let result: Awaited<ReturnType<AuthProviderDeps['fetchMe']>>;
@@ -177,8 +185,11 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
       const body = result.data;
       if (!body || typeof body.role !== 'string' || typeof body.user_id !== 'string') return;
 
+      // R2: apply the answer only to the session that asked, and only for the same user. A stale
+      // answer (user A's, arriving while user B is signed in) must not sign B out.
       const session = sessionRef.current;
       if (!session || isLogoutPending(d.storage())) return;
+      if (sessionKeyOf(session) !== startedFor || userIdOf(session) !== body.user_id) return;
       // Server role wins over the JWT claim. A non-web role must not use the dashboard.
       if (!isWebRole(body.role)) {
         await d.forceSignOut('ROLE_NOT_ALLOWED', session.access_token);
@@ -200,6 +211,8 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
   const runLogout = useCallback((timeoutMs: number): Promise<void> => {
     if (logoutInFlightRef.current) return logoutInFlightRef.current;
     const d = depsRef.current;
+    // Late responses of this session must not refresh, re-bind or show a banner (review R2).
+    if (sessionRef.current) d.markSessionEnded(sessionKeyOf(sessionRef.current));
     const flow = performLogout(
       {
         storage: d.storage(),

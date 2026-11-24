@@ -8,8 +8,17 @@ export function tokenFor(claims: object): string {
 }
 
 /** Minimal Supabase session for tests (only the fields the app reads). */
-export function sessionFor(role: string | undefined, userId = 'user-1', tokenSuffix = ''): Session {
-  const claims: Record<string, unknown> = { sub: userId, jti: tokenSuffix };
+/**
+ * Minimal Supabase session. `sessionId` defaults to one per user, so token refreshes of the same
+ * sign-in share it; pass a different one for a new sign-in of the same user.
+ */
+export function sessionFor(
+  role: string | undefined,
+  userId = 'user-1',
+  tokenSuffix = '',
+  sessionId = `sess-${userId}`,
+): Session {
+  const claims: Record<string, unknown> = { sub: userId, session_id: sessionId, jti: tokenSuffix };
   if (role !== undefined) claims.user_role = role;
   return { access_token: tokenFor(claims), user: { id: userId } } as unknown as Session;
 }
@@ -42,6 +51,7 @@ export function makeAuthDeps(overrides: Partial<AuthProviderDeps> = {}) {
       emit('SIGNED_OUT', null);
     }),
     forceSignOut: vi.fn<AuthProviderDeps['forceSignOut']>().mockResolvedValue(undefined),
+    markSessionEnded: vi.fn<AuthProviderDeps['markSessionEnded']>(),
     setLoginNavigator: vi.fn<AuthProviderDeps['setLoginNavigator']>(() => () => undefined),
     storage: () => window.localStorage,
     mode: 'real' as string | undefined,
