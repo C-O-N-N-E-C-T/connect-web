@@ -116,7 +116,7 @@ The login form validates the email format and that the password is not empty bef
 
 ### AuthProvider
 
-`src/auth/AuthProvider.tsx` holds the session and role for the whole app. Components read them with `useAuth()` (`status`: `loading` | `signedIn` | `signedOut`, `session`, `role`, `logout()`).
+`src/auth/AuthProvider.tsx` holds the session and role for the whole app. Components read them with `useAuth()` (`status`: `loading` | `signedIn` | `signedOut`, `session`, `role`, `connectionProblem`, `logout()`, `revalidate()`).
 
 - On start it reads the stored Supabase session (`getSession()`), so the session and role survive a page reload. It then subscribes to `onAuthStateChange` (sign-in, token refresh, sign-out in another tab). The callback only updates state; it never awaits a Supabase call (known supabase-js deadlock).
 - **Supabase unreachable at start (R4).** If the stored token has to be refreshed while Supabase cannot be reached (offline, 5xx), supabase-js keeps the session but cannot return it. The app does not treat this as "signed out": it stays in `loading` with "Sunucuya ulaşılamıyor. Yeniden deneniyor…" (no panel, no `/login`), and reads the session again after 2, 5 and 10 s, then every 30 s. A `TOKEN_REFRESHED` from supabase-js also ends the wait. Because of the SDK's 60 s refresh-failure cooldown (see below), the wait can last about a minute after the network returns. The same rule applies to the back/forward-cache re-check: a transient failure keeps the current state.
@@ -185,6 +185,8 @@ src/
     AuthProvider.tsx       session + role state, useAuth(), /auth/me check, interrupted-logout recovery
     authRuntime.ts         app wiring: Supabase, API client, forced sign-out
     forcedSignOut.ts       forced sign-out (reason for /login, local sign-out, navigation)
+    endedSessions.ts       sessions this tab ended on purpose (late responses are ignored)
+    refreshResult.ts       classifies supabase-js refresh / getSession errors (definitive vs transient)
     logout.ts              logout flow with the pending flag
     login.ts               login flow (dependency-injected, unit tested)
     RequireRole.tsx        route guard by role
@@ -194,8 +196,10 @@ src/
     SeismographBackground.tsx     decorative login background
     BrandMark.tsx, icons.tsx
   lib/
-    supabase.ts            Supabase client (anon key only)
+    supabase.ts            Supabase client (anon key only) and its session storage key
     jwt.ts                 reads claims from the token (no signature check, UI only)
+    storage.ts             Web Storage access that never throws (storage may be blocked)
+    deadline.ts            promise deadline helper
     roles.ts               web roles and routing
   pages/
     LoginPage.tsx
