@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   classifySignInError,
@@ -7,6 +7,8 @@ import {
   type LoginErrorCode,
 } from '../auth/login';
 import { supabase } from '../lib/supabase';
+import { clearSignOutReason, peekSignOutReason, subscribeSignOutReason } from '../auth/forcedSignOut';
+import { safeSessionStorage } from '../lib/storage';
 import { getOrCreateDeviceId } from '../services/deviceId';
 import { registerBrowserSession } from '../services/authSessionClient';
 import { SupplementaryDisclaimer } from '../components/SupplementaryDisclaimer';
@@ -27,9 +29,29 @@ export function LoginPage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [formError, setFormError] = useState<string | null>(null);
-  const [bannerError, setBannerError] = useState<LoginErrorCode | null>(null);
+  // Reason of a forced sign-out (OSP-70): read once, cleared in the effect below. Reading in the
+  // initializer and clearing in an effect keeps it visible under StrictMode's double invocation.
+  const [bannerError, setBannerError] = useState<LoginErrorCode | null>(() =>
+    peekSignOutReason(safeSessionStorage()),
+  );
   const [submitting, setSubmitting] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+
+  useEffect(() => {
+    // Subscribe FIRST, then re-read: a reason stored between the initial render and this effect
+    // is not lost (review R14). Only a non-null re-read sets the banner, so StrictMode's second
+    // run (after the first one cleared it) keeps the banner.
+    // A forced sign-out while this page is already mounted (e.g. the SDK dropped the session first)
+    // arrives through the subscription.
+    const unsubscribe = subscribeSignOutReason((reason) => {
+      setBannerError(reason);
+      clearSignOutReason(safeSessionStorage());
+    });
+    const pending = peekSignOutReason(safeSessionStorage());
+    if (pending) setBannerError(pending);
+    clearSignOutReason(safeSessionStorage());
+    return unsubscribe;
+  }, []);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -48,7 +70,7 @@ export function LoginPage() {
         return { accessToken: data.session.access_token };
       },
       signOut: async () => {
-        await supabase.auth.signOut();
+        await supabase.auth.signOut({ scope: 'local' });
       },
       registerSession: (accessToken) =>
         registerBrowserSession(

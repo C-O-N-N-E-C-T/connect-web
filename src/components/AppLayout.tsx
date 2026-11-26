@@ -1,6 +1,6 @@
-import type { ReactNode } from 'react';
+import { useRef, useState, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { supabase } from '../lib/supabase';
+import { useAuth } from '../auth/AuthProvider';
 import { SupplementaryDisclaimer } from './SupplementaryDisclaimer';
 
 /**
@@ -9,9 +9,16 @@ import { SupplementaryDisclaimer } from './SupplementaryDisclaimer';
  */
 export function AppLayout({ title, children }: { title: string; children?: ReactNode }) {
   const navigate = useNavigate();
+  const { logout } = useAuth();
+  const [loggingOut, setLoggingOut] = useState(false);
+  const loggingOutRef = useRef(false);
 
+  // Logout flow D1/D2 (see src/auth/logout.ts): never gets stuck, always ends on /login.
   async function handleLogout() {
-    await supabase.auth.signOut();
+    if (loggingOutRef.current) return; // ignore double clicks
+    loggingOutRef.current = true;
+    setLoggingOut(true);
+    await logout();
     navigate('/login', { replace: true });
   }
 
@@ -19,8 +26,8 @@ export function AppLayout({ title, children }: { title: string; children?: React
     <main>
       <header>
         <h1>{title}</h1>
-        <button type="button" onClick={handleLogout}>
-          Çıkış yap
+        <button type="button" onClick={handleLogout} disabled={loggingOut}>
+          {loggingOut ? 'Çıkış yapılıyor…' : 'Çıkış yap'}
         </button>
       </header>
       <SupplementaryDisclaimer />

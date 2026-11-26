@@ -4,7 +4,8 @@ import type { RegisterSessionResult, SessionErrorCode } from '../services/authSe
 
 export type SignInFailure = 'INVALID_CREDENTIALS' | 'NETWORK_ERROR' | 'UNKNOWN';
 
-export type LoginErrorCode = SignInFailure | 'ROLE_NOT_ALLOWED' | SessionErrorCode;
+/** Includes the forced sign-out reasons (OSP-70) so /login can show why the session ended. */
+export type LoginErrorCode = SignInFailure | 'ROLE_NOT_ALLOWED' | 'SESSION_EXPIRED' | SessionErrorCode;
 
 export type LoginResult = { ok: true; route: string } | { ok: false; code: LoginErrorCode };
 
@@ -23,6 +24,7 @@ export function classifySignInError(error: { status?: number }): SignInFailure {
 /** Dependencies are injected so the flow can be unit-tested without Supabase or fetch. */
 export interface LoginDeps {
   signIn(email: string, password: string): Promise<{ accessToken: string } | { error: SignInFailure }>;
+  /** Must sign out with `scope: 'local'` (design D2). */
   signOut(): Promise<void>;
   registerSession(accessToken: string): Promise<RegisterSessionResult>;
 }
@@ -67,6 +69,7 @@ export const LOGIN_ERROR_MESSAGES: Record<LoginErrorCode, string> = {
   DEVICE_REVOKED: 'Bu cihazın erişimi iptal edildi.',
   RATE_LIMITED: 'Çok fazla deneme yapıldı. Lütfen bir dakika sonra tekrar deneyin.',
   SESSION_NOT_BOUND: 'Oturum cihaza bağlanamadı. Tekrar giriş yapın.',
+  SESSION_EXPIRED: 'Oturumunuzun süresi doldu. Lütfen tekrar giriş yapın.',
   NETWORK_ERROR: 'Bağlantı kurulamadı. İnternet bağlantınızı kontrol edin.',
   UNKNOWN: 'Beklenmeyen bir hata oluştu.',
 };

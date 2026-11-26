@@ -1,35 +1,26 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import { act, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { RequireRole } from './RequireRole';
+import { AuthProvider, type AuthProviderDeps } from './AuthProvider';
+import { makeAuthDeps, sessionFor } from '../test/authTestUtils';
 
-const mocks = vi.hoisted(() => ({
-  getSession: vi.fn(),
-}));
-
-vi.mock('../lib/supabase', () => ({
-  supabase: { auth: { getSession: mocks.getSession } },
-}));
-
-function tokenFor(claims: object): string {
-  const b64url = (s: string) => btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  return `${b64url('{"alg":"HS256"}')}.${b64url(JSON.stringify(claims))}.sig`;
-}
-
-function renderGuarded() {
+function renderGuarded(deps: AuthProviderDeps) {
   return render(
     <MemoryRouter initialEntries={['/dashboard']}>
-      <Routes>
-        <Route path="/login" element={<p>LOGIN SCREEN</p>} />
-        <Route
-          path="/dashboard"
-          element={
-            <RequireRole allow={['coordinator', 'administrator']}>
-              <p>PANEL CONTENT</p>
-            </RequireRole>
-          }
-        />
-      </Routes>
+      <AuthProvider deps={deps}>
+        <Routes>
+          <Route path="/login" element={<p>LOGIN SCREEN</p>} />
+          <Route
+            path="/dashboard"
+            element={
+              <RequireRole allow={['coordinator', 'administrator']}>
+                <p>PANEL CONTENT</p>
+              </RequireRole>
+            }
+          />
+        </Routes>
+      </AuthProvider>
     </MemoryRouter>,
   );
 }
@@ -40,56 +31,74 @@ function firePageShow(persisted: boolean) {
   window.dispatchEvent(event);
 }
 
+/** Mock mode: no GET /auth/me, so only the local session decides (as before OSP-70). */
+function setup() {
+  return makeAuthDeps({ mode: 'mock' });
+}
+
 beforeEach(() => {
-  vi.clearAllMocks();
+  window.localStorage.clear();
 });
 
 describe('RequireRole', () => {
   it('shows the panel for an allowed role', async () => {
-    mocks.getSession.mockResolvedValue({
-      data: { session: { access_token: tokenFor({ user_role: 'coordinator' }) } },
-    });
-    renderGuarded();
+    const { deps } = setup();
+    deps.getSession.mockResolvedValue(sessionFor('coordinator'));
+    renderGuarded(deps);
     expect(await screen.findByText('PANEL CONTENT')).toBeInTheDocument();
   });
 
+  it('shows a loading state, not the panel, until the session is known', () => {
+    const { deps } = setup();
+    deps.getSession.mockReturnValue(new Promise(() => undefined));
+    renderGuarded(deps);
+    expect(screen.getByText('Yükleniyor…')).toBeInTheDocument();
+    expect(screen.queryByText('PANEL CONTENT')).not.toBeInTheDocument();
+  });
+
   it('redirects to login when there is no session', async () => {
-    mocks.getSession.mockResolvedValue({ data: { session: null } });
-    renderGuarded();
+    const { deps } = setup();
+    deps.getSession.mockResolvedValue(null);
+    renderGuarded(deps);
     expect(await screen.findByText('LOGIN SCREEN')).toBeInTheDocument();
   });
 
   it('redirects to login for a role that is not allowed', async () => {
-    mocks.getSession.mockResolvedValue({
-      data: { session: { access_token: tokenFor({ user_role: 'rescuer' }) } },
-    });
-    renderGuarded();
+    const { deps } = setup();
+    deps.getSession.mockResolvedValue(sessionFor('rescuer'));
+    renderGuarded(deps);
+    expect(await screen.findByText('LOGIN SCREEN')).toBeInTheDocument();
+  });
+
+  it('redirects to login when the session ends (SIGNED_OUT event)', async () => {
+    const { deps, emit } = setup();
+    deps.getSession.mockResolvedValue(sessionFor('coordinator'));
+    renderGuarded(deps);
+    expect(await screen.findByText('PANEL CONTENT')).toBeInTheDocument();
+
+    act(() => emit('SIGNED_OUT', null));
     expect(await screen.findByText('LOGIN SCREEN')).toBeInTheDocument();
   });
 
   it('re-checks the session when restored from the back/forward cache', async () => {
-    mocks.getSession
-      .mockResolvedValueOnce({
-        data: { session: { access_token: tokenFor({ user_role: 'coordinator' }) } },
-      })
-      .mockResolvedValueOnce({ data: { session: null } });
+    const { deps } = setup();
+    deps.getSession.mockResolvedValueOnce(sessionFor('coordinator')).mockResolvedValueOnce(null);
 
-    renderGuarded();
+    renderGuarded(deps);
     expect(await screen.findByText('PANEL CONTENT')).toBeInTheDocument();
 
     act(() => firePageShow(true));
     await waitFor(() => expect(screen.getByText('LOGIN SCREEN')).toBeInTheDocument());
-    expect(mocks.getSession).toHaveBeenCalledTimes(2);
+    expect(deps.getSession).toHaveBeenCalledTimes(2);
   });
 
   it('ignores normal page shows (not restored from cache)', async () => {
-    mocks.getSession.mockResolvedValue({
-      data: { session: { access_token: tokenFor({ user_role: 'coordinator' }) } },
-    });
-    renderGuarded();
+    const { deps } = setup();
+    deps.getSession.mockResolvedValue(sessionFor('coordinator'));
+    renderGuarded(deps);
     expect(await screen.findByText('PANEL CONTENT')).toBeInTheDocument();
 
     act(() => firePageShow(false));
-    expect(mocks.getSession).toHaveBeenCalledTimes(1);
+    expect(deps.getSession).toHaveBeenCalledTimes(1);
   });
 });

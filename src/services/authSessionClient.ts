@@ -20,7 +20,10 @@ export type SessionErrorCode =
   | 'NETWORK_ERROR'
   | 'UNKNOWN';
 
-export type RegisterSessionResult = { ok: true } | { ok: false; code: SessionErrorCode };
+/** `status` is the HTTP status of a rejected request (absent for network errors). */
+export type RegisterSessionResult =
+  | { ok: true }
+  | { ok: false; code: SessionErrorCode; status?: number };
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -34,7 +37,7 @@ const KNOWN_CODES: ReadonlySet<string> = new Set([
 export async function registerBrowserSession(
   input: RegisterSessionInput,
   accessToken: string,
-  options: { mode?: string; apiBaseUrl?: string; fetchImpl?: FetchLike } = {},
+  options: { mode?: string; apiBaseUrl?: string; fetchImpl?: FetchLike; signal?: AbortSignal } = {},
 ): Promise<RegisterSessionResult> {
   const mode = options.mode ?? import.meta.env.VITE_AUTH_SESSION_MODE;
   if (mode === 'mock') {
@@ -53,6 +56,7 @@ export async function registerBrowserSession(
         Authorization: `Bearer ${accessToken}`,
       },
       body: JSON.stringify({ device_id: input.deviceId, device_name: input.deviceName }),
+      signal: options.signal,
     });
   } catch {
     return { ok: false, code: 'NETWORK_ERROR' };
@@ -70,7 +74,8 @@ export async function registerBrowserSession(
     code = undefined;
   }
 
-  if (response.status === 429) return { ok: false, code: 'RATE_LIMITED' };
-  if (code && KNOWN_CODES.has(code)) return { ok: false, code: code as SessionErrorCode };
-  return { ok: false, code: 'UNKNOWN' };
+  const status = response.status;
+  if (status === 429) return { ok: false, code: 'RATE_LIMITED', status };
+  if (code && KNOWN_CODES.has(code)) return { ok: false, code: code as SessionErrorCode, status };
+  return { ok: false, code: 'UNKNOWN', status };
 }

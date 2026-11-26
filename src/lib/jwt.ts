@@ -27,3 +27,17 @@ export function readUserRole(token: string): unknown {
     return undefined;
   }
 }
+
+/**
+ * Identity of the Supabase session a token belongs to: the `session_id` claim (kept across token
+ * refreshes, new for every sign-in), else `sub`. Null for a malformed token.
+ */
+export function readSessionKey(token: string): string | null {
+  try {
+    const claims = decodeJwtClaims(token);
+    const key = claims.session_id ?? claims.sub;
+    return typeof key === 'string' ? key : null;
+  } catch {
+    return null;
+  }
+}

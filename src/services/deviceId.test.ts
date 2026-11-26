@@ -15,3 +15,19 @@ describe('getOrCreateDeviceId', () => {
     expect(second).toBe(first);
   });
 });
+
+describe('getOrCreateDeviceId with blocked storage (R11)', () => {
+  it('returns a stable id for the page load instead of throwing', () => {
+    const blocked = {
+      getItem: () => {
+        throw new DOMException('blocked', 'SecurityError');
+      },
+      setItem: () => {
+        throw new DOMException('blocked', 'SecurityError');
+      },
+    } as unknown as Storage;
+    const first = getOrCreateDeviceId(blocked);
+    expect(first).toMatch(/^[0-9a-f-]{36}$/);
+    expect(getOrCreateDeviceId(null)).toBe(first);
+  });
+});
