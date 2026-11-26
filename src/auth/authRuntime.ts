@@ -4,7 +4,6 @@
  */
 import type { AuthChangeEvent, Session } from '@supabase/supabase-js';
 import { SUPABASE_AUTH_STORAGE_KEY, supabase } from '../lib/supabase';
-import { readSessionKey } from '../lib/jwt';
 import { withDeadline } from '../lib/deadline';
 import {
   safeLocalStorage,
@@ -13,6 +12,7 @@ import {
   storageRemove,
 } from '../lib/storage';
 import { createApiClient } from '../services/apiClient';
+import { createAdminApi } from '../services/adminApi';
 import { registerBrowserSession } from '../services/authSessionClient';
 import { getOrCreateDeviceId } from '../services/deviceId';
 import { createForcedSignOut } from './forcedSignOut';
@@ -20,6 +20,7 @@ import { clearSessionEnded, isSessionEnded, markSessionEnded } from './endedSess
 import { isLogoutPending, SIGN_OUT_TIMEOUT_MS } from './logout';
 import { classifyRefresh } from './refreshResult';
 import type { AuthProviderDeps } from './AuthProvider';
+import { sessionKeyFromStoredValue } from './storedSession';
 
 /** getSession() could not determine the session for a transient reason (R4). */
 export class SessionUnavailableError extends Error {
@@ -34,15 +35,7 @@ const localSignOutListeners = new Set<AuthListener>();
 
 /** Identity (session_id, else sub) of the session persisted by supabase-js, or null. */
 export function storedSessionKey(storage: Storage | null): string | null {
-  const raw = storageGet(storage, SUPABASE_AUTH_STORAGE_KEY);
-  if (!raw) return null;
-  try {
-    const token = (JSON.parse(raw) as { access_token?: unknown }).access_token;
-    if (typeof token !== 'string') return raw;
-    return readSessionKey(token) ?? raw;
-  } catch {
-    return raw;
-  }
+  return sessionKeyFromStoredValue(storageGet(storage, SUPABASE_AUTH_STORAGE_KEY));
 }
 
 /**
@@ -112,6 +105,9 @@ export const apiClient = createApiClient({
   isLogoutPending: (sessionKey) => isLogoutPending(safeLocalStorage(), sessionKey),
 });
 
+/** OSP-72: administrator API on top of the same client (same 401/403 handling). */
+export const adminApi = createAdminApi(apiClient);
+
 /** GET /api/v1/auth/me response (contract in design D3 / connect-backend docs). */
 export interface AuthMeResponse {
   user_id: string;
@@ -123,6 +119,8 @@ export const defaultAuthDeps: AuthProviderDeps = {
   markSessionEnded,
   clearSessionEnded,
   storedSessionKey: () => storedSessionKey(safeLocalStorage()),
+  // OSP-72 (R21): AuthProvider watches this key for sign-outs in other tabs.
+  authStorageKey: SUPABASE_AUTH_STORAGE_KEY,
   getSession: async () => {
     const result = await supabase.auth.getSession();
     if (result.data.session) return result.data.session;

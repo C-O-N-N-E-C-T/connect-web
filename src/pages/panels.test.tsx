@@ -1,16 +1,20 @@
 import { describe, expect, it, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import type { ReactNode } from 'react';
 import { CoordinatorDashboard } from './CoordinatorDashboard';
 import { AdminPage } from './AdminPage';
 import { AuthContextProvider } from '../auth/AuthProvider';
 import type { AppRole } from '../lib/roles';
+import { AdminApiProvider } from '../admin/AdminApiContext';
+import { makeAdminApi } from '../test/adminTestUtils';
 
 // OSP-71: rol parametreli; varsayılan administrator (önceki testlerle aynı).
-function withAuth(children: ReactNode, role: AppRole = 'administrator') {
+// OSP-72: AdminPage has nested routes and calls the admin API, so the tree gets a fake AdminApi
+// and is rendered under `/admin/*` at `/admin`.
+function withAuth(children: ReactNode, role: AppRole = 'administrator', path = '/') {
   return (
-    <MemoryRouter>
+    <MemoryRouter initialEntries={[path]}>
       <AuthContextProvider
         value={{
           status: 'signedIn',
@@ -24,7 +28,12 @@ function withAuth(children: ReactNode, role: AppRole = 'administrator') {
           signOutDisallowedRole: vi.fn().mockResolvedValue(undefined),
         }}
       >
-        {children}
+        <AdminApiProvider api={makeAdminApi()}>
+          <Routes>
+            <Route path="/admin/*" element={children} />
+            <Route path="*" element={children} />
+          </Routes>
+        </AdminApiProvider>
       </AuthContextProvider>
     </MemoryRouter>
   );
@@ -37,7 +46,7 @@ describe('main panel layouts show the disclaimer (AC-29)', () => {
   });
 
   it('administrator page', () => {
-    render(withAuth(<AdminPage />));
+    render(withAuth(<AdminPage />, 'administrator', '/admin'));
     expect(screen.getByRole('note')).toHaveTextContent('kurtarmayı garanti etmez');
   });
 });

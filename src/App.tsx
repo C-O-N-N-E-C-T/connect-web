@@ -1,6 +1,10 @@
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { AuthProvider } from './auth/AuthProvider';
-import { defaultAuthDeps } from './auth/authRuntime';
+import { adminApi, defaultAuthDeps } from './auth/authRuntime';
+import { AdminApiProvider } from './admin/AdminApiContext';
+import { readDeviceId } from './services/deviceId';
+
+const currentDeviceId = () => readDeviceId();
 import { RequireRole } from './auth/RequireRole';
 import { LoginPage } from './pages/LoginPage';
 import { CoordinatorDashboard } from './pages/CoordinatorDashboard';
@@ -43,7 +47,14 @@ export function App() {
   return (
     <BrowserRouter>
       <AuthProvider deps={defaultAuthDeps}>
-        <AppRoutes />
+        {/* OSP-72: admin pages get their API from context (tests inject fakes). */}
+        <AdminApiProvider
+          api={adminApi}
+          currentDeviceId={currentDeviceId}
+          backendDisabled={defaultAuthDeps.mode === 'mock'}
+        >
+          <AppRoutes />
+        </AdminApiProvider>
       </AuthProvider>
     </BrowserRouter>
   );
