@@ -2,13 +2,13 @@ import { loadEnv } from 'vite';
 import { defineConfig } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 
-const REQUIRED_BUILD_ENV = ['VITE_SUPABASE_URL', 'VITE_SUPABASE_ANON_KEY'];
+const REQUIRED_BUILD_ENV = ['VITE_SUPABASE_URL', 'VITE_SUPABASE_ANON_KEY', 'VITE_API_BASE_URL'];
 
 export default defineConfig(({ command, mode }) => {
   // Build sırasında zorunlu değişkenler eksikse dur; aksi halde hata sadece tarayıcıda görünür.
   if (command === 'build') {
     const env = loadEnv(mode, process.cwd(), 'VITE_');
-    const missing = REQUIRED_BUILD_ENV.filter((key) => !env[key]);
+    const missing = REQUIRED_BUILD_ENV.filter((key) => !env[key]?.trim());
     if (missing.length > 0) {
       throw new Error(`Build durdu: ${missing.join(', ')} tanımlı değil (.env.example'a bakın)`);
     }
