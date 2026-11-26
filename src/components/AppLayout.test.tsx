@@ -17,7 +17,7 @@ function renderPanel(deps: ReturnType<typeof makeAuthDeps>['deps']) {
           <Route
             path="/dashboard"
             element={
-              <RequireRole allow={['coordinator']}>
+              <RequireRole action="viewOperations">
                 <AppLayout title="Koordinasyon Paneli" />
               </RequireRole>
             }

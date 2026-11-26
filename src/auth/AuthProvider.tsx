@@ -12,7 +12,7 @@ import { useLocation, useNavigate } from 'react-router-dom';
 import type { AuthChangeEvent, Session } from '@supabase/supabase-js';
 import { decodeJwtClaims, readSessionKey, readUserRole } from '../lib/jwt';
 import { isWebRole, type AppRole } from '../lib/roles';
-import type { ApiResult } from '../services/apiClient';
+import type { ApiErrorKind, ApiResult, TransientKind } from '../services/apiClient';
 import type { ForceSignOut } from './forcedSignOut';
 import {
   ANY_SESSION,
@@ -36,6 +36,21 @@ export interface AuthState {
    * status then stays `loading` (no panel, no /login) and the read is retried.
    */
   connectionProblem: boolean;
+  /**
+   * OSP-71: `role` bu oturum için GET /auth/me ile sunucudan onaylandı mı. Yalnızca /auth/me
+   * cevabı AYNI oturuma ve AYNI kullanıcıya uygulandığında true olur; yeni oturumda, kullanıcı
+   * değişince ve çıkışta false'a döner. /admin gibi sunucu onayı isteyen rotalar bunu bekler
+   * (JWT'deki eski bir rol iddiası tek başına yönetici ekranını açmasın diye). Mock modda backend
+   * olmadığı için oturum açıkken her zaman true'dur (rol yalnızca JWT'den gelir).
+   */
+  roleConfirmed: boolean;
+  /**
+   * OSP-71: bu oturum için son GET /auth/me geçici bir hatayla (ağ, TIMEOUT, 5xx, 429) bitti.
+   * Rol onayı bekleyen ekranlar (ör. /admin) bu sırada süresiz "Yükleniyor…" yerine bağlantı
+   * sorunu mesajını gösterir. Oturum KAPANMAZ; aynı oturum için başarılı bir /auth/me gelince,
+   * yeni oturumda ve çıkışta false'a döner.
+   */
+  roleCheckUnreachable: boolean;
 }
 
 export interface AuthContextValue extends AuthState {
@@ -43,6 +58,13 @@ export interface AuthContextValue extends AuthState {
   logout(): Promise<void>;
   /** Re-reads the local session (used after a back/forward-cache restore). */
   revalidate(): Promise<void>;
+  /**
+   * OSP-71: oturumdaki rol web paneline izinli değilse (rescuer) oturumu ROLE_NOT_ALLOWED
+   * gerekçesiyle zorla kapatır. Sunucu rolü için checkMe'nin kullandığı mekanizmanın
+   * (`forceSignOut`) aynısıdır; rota koruyucusu JWT'den gelen rescuer rolü için efekt içinde
+   * çağırır. Rol bu arada web rolüne döndüyse ya da oturumun çıkışı beklemedeyse hiçbir şey yapmaz.
+   */
+  signOutDisallowedRole(): Promise<void>;
 }
 
 export interface AuthMeBody {
@@ -81,8 +103,21 @@ export interface AuthProviderDeps {
   now(): number;
 }
 
-/** A focus/visibility check is skipped if the previous one started less than this long ago. */
+/**
+ * GET /auth/me için en kısa aralık (throttle). Visibility, pencere `focus`'u, açılış kurtarması
+ * (R4) sonrası ve /login'den panele geçişteki kontroller, AYNI oturum için son kontrol bu süreden
+ * daha yakın zamanda başladıysa atlanır. Farklı bir oturum (yeni giriş) bu sınıra takılmaz ve
+ * hemen doğrulanır (OSP-71). Periyodik kontrol bu sınırı kullanmaz; aralığı zaten 15 sn'dir.
+ */
 export const ME_CHECK_MIN_INTERVAL_MS = 10_000;
+
+/**
+ * OSP-71 (AC-19): sekme görünürken ve oturum açıkken GET /auth/me bu aralıkla tekrarlanır.
+ * Yalnızca visibility'ye bağlı kontrol, ekranda açık kalan bir sekmede iptal edilen cihazı hiç
+ * fark etmiyordu. Backend /auth/me'yi /auth/* rate limit'inden muaf tuttuğu için bu sıklık giriş
+ * kotasını tüketmez. Periyot her yeni kontrolle (hangi yoldan başlarsa başlasın) sıfırlanır.
+ */
+export const ME_CHECK_INTERVAL_MS = 15_000;
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
@@ -119,8 +154,56 @@ export function sessionKeyOf(session: Session): string | null {
   return readSessionKey(session.access_token) ?? userIdOf(session);
 }
 
-const LOADING: AuthState = { status: 'loading', session: null, role: null, connectionProblem: false };
-const SIGNED_OUT: AuthState = { status: 'signedOut', session: null, role: null, connectionProblem: false };
+const LOADING: AuthState = {
+  status: 'loading',
+  session: null,
+  role: null,
+  connectionProblem: false,
+  roleConfirmed: false,
+  roleCheckUnreachable: false,
+};
+const SIGNED_OUT: AuthState = {
+  status: 'signedOut',
+  session: null,
+  role: null,
+  connectionProblem: false,
+  roleConfirmed: false,
+  roleCheckUnreachable: false,
+};
+
+/**
+ * OSP-71: GET /auth/me sonucu için geçici hata türleri. Bunlar hiçbir zaman çıkış nedeni değildir;
+ * yalnızca "sunucuya ulaşılamıyor" bilgisini tetikler. Liste apiClient'ın `TransientKind`'ına
+ * bağlıdır: `Record<TransientKind, true>` eksik ya da fazla bir anahtarda derleme hatası verir, böylece
+ * iki liste birbirinden kayamaz (Set<TransientKind> yalnızca fazla üyeyi yakalardı, eksiği değil).
+ */
+const TRANSIENT_ME_ERRORS: Readonly<Record<TransientKind, true>> = {
+  NETWORK_ERROR: true,
+  TIMEOUT: true,
+  SERVER_ERROR: true,
+  RATE_LIMITED: true,
+};
+
+function isTransientMeError(kind: ApiErrorKind): kind is TransientKind {
+  // Kendi anahtarı mı (prototipten gelen `toString` vb. sayılmaz).
+  return Object.prototype.hasOwnProperty.call(TRANSIENT_ME_ERRORS, kind);
+}
+
+/**
+ * OSP-71: rol onayı için kullanılan oturum kimliği. `sessionKeyOf`'tan farklı olarak user id'ye
+ * DÜŞMEZ: token'da `session_id` yoksa aynı kullanıcının yeni girişi eski onayı devralabilirdi; bu
+ * durumda null döner ve onay hiç verilmez (güvenli taraf). Throttle, endedSessions ve
+ * logout-pending eskisi gibi `sessionKeyOf` kullanır.
+ */
+function confirmKeyOf(session: Session): string | null {
+  // readSessionKey bilerek kullanılmaz: o da `session_id` yoksa `sub`'a düşer.
+  try {
+    const sessionId = decodeJwtClaims(session.access_token).session_id;
+    return typeof sessionId === 'string' && sessionId !== '' ? sessionId : null;
+  } catch {
+    return null;
+  }
+}
 
 /** Retry delays for reading the session while Supabase is unreachable (R4); the last one repeats. */
 export const SESSION_RETRY_DELAYS_MS = [2_000, 5_000, 10_000, 30_000];
@@ -136,6 +219,9 @@ export const SESSION_RETRY_DELAYS_MS = [2_000, 5_000, 10_000, 30_000];
  *   protected UI is rendered meanwhile (design D2).
  * - When the tab becomes visible again, GET /auth/me runs once more so a revoked device or
  *   disabled account is noticed (AC-19, design D3).
+ * - OSP-71: sekme görünürken 15 sn'de bir, pencereye dönüşte (`focus`) ve girişten / açılış
+ *   kurtarmasından sonra da GET /auth/me çalışır; böylece açık duran panel de bir sonraki
+ *   kontrolde kapanır (AC-19).
  *
  * Must be rendered inside the router (it navigates to /login on a forced sign-out).
  */
@@ -152,23 +238,58 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
   pathnameRef.current = location.pathname;
 
   /** Role confirmed by GET /auth/me, kept per user so token refreshes do not overwrite it. */
-  const serverRoleRef = useRef<{ userId: string; role: AppRole } | null>(null);
+  // OSP-71: onayın hangi oturum için alındığı da tutulur (`sessionKey`). Rol seçimi eskisi gibi
+  // kullanıcıya göredir; `roleConfirmed` ise yalnızca aynı oturum için true olur.
+  const serverRoleRef = useRef<{ userId: string; sessionKey: string | null; role: AppRole } | null>(null);
   const meInFlightRef = useRef<Promise<void> | null>(null);
   const lastMeStartRef = useRef<number | null>(null);
+  // OSP-71: son kontrolün hangi oturum için başladığı. Throttle yalnızca aynı oturum için
+  // uygulanır; yeni bir giriş (farklı oturum) 10 sn kuralına takılmadan hemen doğrulanır.
+  const lastMeKeyRef = useRef<string | null>(null);
+  // OSP-71: periyodik zamanlayıcıyı yeniden kuran fonksiyon (periyot efekti aktifken dolu).
+  // checkMe yeni bir istek başlattığında çağrılır; böylece iki kontrol arası en fazla 15 sn olur
+  // ve focus/visibility kontrolünün hemen ardından gereksiz bir periyodik istek gitmez.
+  const reschedulePeriodicRef = useRef<(() => void) | null>(null);
+  // OSP-71: son /auth/me'si geçici hatayla biten oturumun anahtarı (`sessionKeyOf`). Token
+  // yenilemesinde (applySession) bilgi bu sayede korunur; başka bir oturuma taşınmaz.
+  const meUnreachableKeyRef = useRef<string | null>(null);
   const logoutInFlightRef = useRef<Promise<void> | null>(null);
+
+  /** Bir oturumun geçerli rolü: aynı kullanıcı için sunucu rolü biliniyorsa o, yoksa JWT iddiası. */
+  const roleOf = useCallback((session: Session): AppRole | null => {
+    const server = serverRoleRef.current;
+    return server && server.userId === userIdOf(session) ? server.role : jwtRole(session);
+  }, []);
 
   const applySession = useCallback((session: Session | null) => {
     sessionRef.current = session;
     if (!session) {
       serverRoleRef.current = null;
+      meUnreachableKeyRef.current = null;
       setState(SIGNED_OUT);
       return;
     }
-    const userId = userIdOf(session);
     const server = serverRoleRef.current;
-    const role = server && server.userId === userId ? server.role : jwtRole(session);
-    setState({ status: 'signedIn', session, role, connectionProblem: false });
-  }, []);
+    // OSP-71: onay yalnızca aynı kullanıcı VE aynı oturum için geçerlidir. Aynı oturumun token
+    // yenilemesi onayı korur; aynı kullanıcının yeni bir girişi (farklı session_id) korumaz.
+    // `session_id` claim'i olmayan token'da confirmKeyOf null döner ve onay verilmez.
+    const confirmKey = confirmKeyOf(session);
+    const roleConfirmed =
+      depsRef.current.mode === 'mock' ||
+      (server !== null &&
+        confirmKey !== null &&
+        server.userId === userIdOf(session) &&
+        server.sessionKey === confirmKey);
+    const roleCheckUnreachable = meUnreachableKeyRef.current === sessionKeyOf(session);
+    setState({
+      status: 'signedIn',
+      session,
+      role: roleOf(session),
+      connectionProblem: false,
+      roleConfirmed,
+      roleCheckUnreachable,
+    });
+  }, [roleOf]);
 
   /**
    * GET /api/v1/auth/me — the user's "option 2" decision (design D3): this lightweight endpoint
@@ -187,6 +308,29 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
     if (meInFlightRef.current) return meInFlightRef.current;
     lastMeStartRef.current = d.now();
     const startedFor = sessionRef.current ? sessionKeyOf(sessionRef.current) : null;
+    // OSP-71: onay anahtarı ayrı tutulur (session_id yoksa null -> onay yok).
+    const startedConfirmKey = sessionRef.current ? confirmKeyOf(sessionRef.current) : null;
+    lastMeKeyRef.current = startedFor;
+    // OSP-71: yeni bir kontrol başladı; periyodik zamanlayıcı bu andan itibaren 15 sn sayar.
+    reschedulePeriodicRef.current?.();
+
+    /**
+     * OSP-71: "sunucuya ulaşılamıyor" işaretini günceller. Yalnızca soran oturum hâlâ geçerliyse
+     * ve çıkışı beklemede değilse uygulanır (R2): başka bir oturumun geç gelen sonucu yeni oturumu
+     * etkilemez. Hiçbir durumda oturumu kapatmaz.
+     */
+    const setUnreachable = (unreachable: boolean) => {
+      const current = sessionRef.current;
+      if (!current || startedFor === null || sessionKeyOf(current) !== startedFor) return;
+      if (isLogoutPending(d.storage(), startedFor)) return;
+      if (unreachable) meUnreachableKeyRef.current = startedFor;
+      else if (meUnreachableKeyRef.current === startedFor) meUnreachableKeyRef.current = null;
+      setState((prev) =>
+        prev.session && sessionKeyOf(prev.session) === startedFor && prev.roleCheckUnreachable !== unreachable
+          ? { ...prev, roleCheckUnreachable: unreachable }
+          : prev,
+      );
+    };
 
     const run = (async () => {
       let result: Awaited<ReturnType<AuthProviderDeps['fetchMe']>>;
@@ -199,9 +343,21 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
             name: error instanceof Error ? error.name : typeof error,
           });
         }
+        // OSP-71: beklenmeyen istisna da geçici hata gibi ele alınır (sunucuya ulaşıldığı
+        // doğrulanamadı); /admin süresiz "Yükleniyor…"da kalmaz. Oturum kapanmaz.
+        setUnreachable(true);
         return;
       }
-      if (!result.ok) return;
+      if (!result.ok) {
+        // OSP-71: geçici hata (ağ, TIMEOUT, 5xx, 429) işareti koyar. Geçici olmayan bir sonuç
+        // (HTTP_ERROR, FORBIDDEN, SESSION_CHANGED vb.) sunucunun erişilebilir olduğunu gösterir ve
+        // işareti kaldırır. Kesin red (401/403 -> zorla çıkış) apiClient'ta eskisi gibi ele alınır;
+        // o durumda oturum zaten bittiği için burada bir şey değişmez.
+        setUnreachable(isTransientMeError(result.error.kind));
+        return;
+      }
+      // OSP-71: 2xx cevap (biçimsiz gövde dahil) sunucunun erişilebilir olduğunu gösterir.
+      setUnreachable(false);
       const body = result.data;
       if (!body || typeof body.role !== 'string' || typeof body.user_id !== 'string') return;
 
@@ -216,9 +372,18 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
         return;
       }
       const role = body.role;
-      serverRoleRef.current = { userId: body.user_id, role };
+      serverRoleRef.current = { userId: body.user_id, sessionKey: startedConfirmKey, role };
+      // OSP-71: cevap bu oturum için alındıysa (ve token'da session_id varsa) rol sunucu onaylıdır.
       setState((prev) =>
-        prev.session && userIdOf(prev.session) === body.user_id ? { ...prev, role } : prev,
+        prev.session && userIdOf(prev.session) === body.user_id
+          ? {
+              ...prev,
+              role,
+              roleConfirmed:
+                prev.roleConfirmed ||
+                (startedConfirmKey !== null && confirmKeyOf(prev.session) === startedConfirmKey),
+            }
+          : prev,
       );
     })();
 
@@ -227,6 +392,34 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
     });
     return meInFlightRef.current;
   }, []);
+
+  /**
+   * OSP-71: açılış dışındaki tüm kontrol yollarının (visibility, focus, periyodik, giriş /
+   * kurtarma sonrası, /login'den panele geçiş) ortak koruması. Kontrol yalnızca şu durumda gider:
+   * oturum var, sekme görünür, /login'de değiliz (R12: orada giriş sürüyor olabilir) ve bu oturumun
+   * çıkışı beklemede değil. `throttle` true ise aynı oturum için son kontrol 10 sn'den yeniyse
+   * atlanır. Aynı anda tek istek kuralı (single-flight) checkMe içinde zaten uygulanır; mock mod da
+   * checkMe içinde atlanır.
+   */
+  const guardedCheck = useCallback(
+    (throttle: boolean) => {
+      const d = depsRef.current;
+      const session = sessionRef.current;
+      if (!session) return;
+      if (document.visibilityState !== 'visible') return;
+      if (pathnameRef.current === '/login') return;
+      const key = sessionKeyOf(session);
+      if (isLogoutPending(d.storage(), key)) return;
+      if (throttle) {
+        const last = lastMeStartRef.current;
+        if (last !== null && lastMeKeyRef.current === key && d.now() - last < ME_CHECK_MIN_INTERVAL_MS) {
+          return;
+        }
+      }
+      void checkMe();
+    },
+    [checkMe],
+  );
 
   const runLogout = useCallback((timeoutMs: number, sessionKey: string | null): Promise<void> => {
     if (logoutInFlightRef.current) return logoutInFlightRef.current;
@@ -262,6 +455,8 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
 
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
     let retries = 0;
+    // OSP-71: giriş / kurtarma sonrası ertelenmiş kontrol zamanlayıcıları (unmount'ta temizlenir).
+    const deferredChecks = new Set<ReturnType<typeof setTimeout>>();
 
     const unsubscribe = d.onAuthStateChange((event, session) => {
       // Synchronous state updates only. Never await a Supabase call inside this callback
@@ -286,7 +481,27 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
       // A real sign-in from the signed-out state (not a token refresh of a session being signed
       // out) is a live session, even if its identity was ended before (sub fallback, R2).
       if (event === 'SIGNED_IN' && !sessionRef.current) d.clearSessionEnded(sessionKeyOf(session));
+      // OSP-71: yalnızca açılış kurtarmasını (R4) çözen TOKEN_REFRESHED sonrası sunucuyla bir kez
+      // doğrula: oturum zaten bu sekmede kayıtlıydı, sadece okunamıyordu. SIGNED_IN burada BİLEREK
+      // tetiklemez: oturumu olmayan sekme /login'dedir; panel yolunda `loading`'de bekleyen bir
+      // sekmeye gelen SIGNED_IN ise başka bir sekmedeki girişin yayınıdır ve o sekmenin
+      // POST /auth/session'ı henüz bitmemiş olabilir. Hemen /auth/me göndermek 403
+      // SESSION_NOT_BOUND, gereksiz bir rebind (rate limit + fazladan LOGIN audit satırı) demektir.
+      // Yeni girişi /login'den panele geçiş kontrolü ve periyodik kontrol karşılar. Oturumu zaten
+      // olan bir sekmedeki TOKEN_REFRESHED (supabase-js'in olağan yenilemesi) de tetiklemez.
+      const recoversSession = !sessionRef.current && event === 'TOKEN_REFRESHED';
       applySession(session);
+      if (recoversSession) {
+        // Bu callback içinde Supabase çağrısı beklenmemeli (supabase-js kilitlenmesi); checkMe
+        // erişim token'ını okuyacağı için setTimeout(..., 0) ile erteliyoruz (unmount'ta silinir).
+        // /login'de guardedCheck atlar; o durumda panele geçiş (pathname değişimi) kontrol eder.
+        // Throttle'lı: açılıştaki getSession kontrolüyle çakışırsa ikinci istek gitmez.
+        const timer = setTimeout(() => {
+          deferredChecks.delete(timer);
+          if (active) guardedCheck(true);
+        }, 0);
+        deferredChecks.add(timer);
+      }
     });
 
     const pending = pendingLogoutKey(d.storage());
@@ -328,9 +543,11 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
     return () => {
       active = false;
       clearTimeout(retryTimer);
+      deferredChecks.forEach((timer) => clearTimeout(timer));
+      deferredChecks.clear();
       unsubscribe();
     };
-  }, [applySession, checkMe, runLogout]);
+  }, [applySession, checkMe, guardedCheck, runLogout]);
 
   // Forced sign-outs navigate through the router.
   useEffect(
@@ -341,22 +558,72 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
     [navigate],
   );
 
-  // Re-check with the server when the tab becomes visible again (no polling).
+  // Sekme tekrar görünür olunca veya pencereye dönülünce (OSP-71: `focus`) sunucuyla yeniden
+  // kontrol et. İkisi de aynı throttle'ı (aynı oturum için 10 sn) kullanır; pencereye dönüşte
+  // genellikle ikisi birden tetiklenir ve böylece tek istek gider.
   useEffect(() => {
-    function handleVisibility() {
+    const handleReturn = () => guardedCheck(true);
+    document.addEventListener('visibilitychange', handleReturn);
+    window.addEventListener('focus', handleReturn);
+    return () => {
+      document.removeEventListener('visibilitychange', handleReturn);
+      window.removeEventListener('focus', handleReturn);
+    };
+  }, [guardedCheck]);
+
+  // OSP-71 (AC-19): periyodik kontrol. Yalnızca oturum açıkken, /login dışında, mock mod değilken
+  // ve sekme görünürken çalışır. Sekme gizlenince zamanlayıcı durur (gereksiz istek yok); görünür
+  // olunca yukarıdaki visibility yolu hemen kontrol eder ve periyot yeniden başlar. Oturum kapanınca
+  // (signOut / zorla çıkış -> status signedOut), /login'e geçince veya unmount'ta efekt temizlenir
+  // ve zamanlayıcı silinir. Her sekme kendi zamanlayıcısını yönetir.
+  const periodicActive =
+    state.status === 'signedIn' && location.pathname !== '/login' && deps.mode !== 'mock';
+  useEffect(() => {
+    if (!periodicActive) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const stop = () => {
+      clearTimeout(timer);
+      timer = undefined;
+    };
+    // Zamanlayıcıyı sıfırdan kurar; sekme gizliyse kurmaz.
+    const schedule = () => {
+      stop();
       if (document.visibilityState !== 'visible') return;
-      const d = depsRef.current;
-      if (!sessionRef.current) return;
-      // On /login a sign-in may be in progress (POST /auth/session not done yet).
-      if (pathnameRef.current === '/login') return;
-      if (isLogoutPending(d.storage(), sessionKeyOf(sessionRef.current))) return;
-      const last = lastMeStartRef.current;
-      if (last !== null && d.now() - last < ME_CHECK_MIN_INTERVAL_MS) return;
-      void checkMe();
+      timer = setTimeout(tick, ME_CHECK_INTERVAL_MS);
+    };
+    function tick() {
+      timer = undefined;
+      // Önce bir sonraki turu kur: istek uçuştaysa checkMe yeni istek başlatmaz (single-flight)
+      // ve zamanlayıcıyı da yeniden kurmaz; periyot yine de devam etmeli.
+      schedule();
+      // Throttle yok: periyodun kendisi zaten son kontrolden 15 sn sonrasıdır.
+      guardedCheck(false);
     }
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') schedule();
+      else stop();
+    };
+    reschedulePeriodicRef.current = schedule;
     document.addEventListener('visibilitychange', handleVisibility);
-    return () => document.removeEventListener('visibilitychange', handleVisibility);
-  }, [checkMe]);
+    schedule();
+    return () => {
+      stop();
+      document.removeEventListener('visibilitychange', handleVisibility);
+      if (reschedulePeriodicRef.current === schedule) reschedulePeriodicRef.current = null;
+    };
+  }, [periodicActive, guardedCheck]);
+
+  // OSP-71: kullanıcı /login'den panele geçtiğinde (yeni giriş tamamlandı ya da kayıtlı oturumla
+  // /login'den yönlendirildi) bir kez kontrol et. /login'de kontrol yapılmadığı (R12) için bu
+  // geçiş, yeni oturumun sunucuda doğrulandığı ilk andır. Throttle aynı oturum için çift isteği önler.
+  const previousPathRef = useRef(location.pathname);
+  useEffect(() => {
+    const previous = previousPathRef.current;
+    previousPathRef.current = location.pathname;
+    if (previous === '/login' && location.pathname !== '/login' && state.status === 'signedIn') {
+      guardedCheck(true);
+    }
+  }, [location.pathname, state.status, guardedCheck]);
 
   const logout = useCallback(
     () =>
@@ -376,9 +643,19 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
     applySession(session);
   }, [applySession]);
 
+  const signOutDisallowedRole = useCallback(async () => {
+    const d = depsRef.current;
+    const session = sessionRef.current;
+    if (!session || isLogoutPending(d.storage(), sessionKeyOf(session))) return;
+    // Yarış koruması: istek ile bu çağrı arasında rol web rolüne döndüyse (ör. sunucu onayı ya da
+    // başka bir kullanıcının girişi) o oturum kapatılmaz.
+    if (roleOf(session) !== 'rescuer') return;
+    await d.forceSignOut('ROLE_NOT_ALLOWED', session.access_token);
+  }, [roleOf]);
+
   const value = useMemo<AuthContextValue>(
-    () => ({ ...state, logout, revalidate }),
-    [state, logout, revalidate],
+    () => ({ ...state, logout, revalidate, signOutDisallowedRole }),
+    [state, logout, revalidate, signOutDisallowedRole],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

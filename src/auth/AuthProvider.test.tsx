@@ -1,8 +1,14 @@
 import { StrictMode } from 'react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, render, screen, waitFor } from '@testing-library/react';
-import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
-import { AuthProvider, ME_CHECK_MIN_INTERVAL_MS, useAuth, type AuthProviderDeps } from './AuthProvider';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
+import {
+  AuthProvider,
+  ME_CHECK_INTERVAL_MS,
+  ME_CHECK_MIN_INTERVAL_MS,
+  useAuth,
+  type AuthProviderDeps,
+} from './AuthProvider';
 import { RequireRole } from './RequireRole';
 import { LOGOUT_PENDING_KEY } from './logout';
 import { makeAuthDeps, sessionFor } from '../test/authTestUtils';
@@ -32,7 +38,7 @@ function renderApp(deps: AuthProviderDeps, path = '/dashboard', strict = false) 
           <Route
             path="/dashboard"
             element={
-              <RequireRole allow={['coordinator', 'administrator']}>
+              <RequireRole action="viewOperations">
                 <p>PANEL CONTENT</p>
               </RequireRole>
             }
@@ -40,7 +46,7 @@ function renderApp(deps: AuthProviderDeps, path = '/dashboard', strict = false) 
           <Route
             path="/admin"
             element={
-              <RequireRole allow={['administrator']}>
+              <RequireRole action="admin" requireConfirmedRole>
                 <p>ADMIN CONTENT</p>
               </RequireRole>
             }
@@ -223,7 +229,11 @@ describe('AuthProvider: GET /auth/me', () => {
       data: { user_id: 'user-1', role: 'coordinator', device_id: 'd' },
     });
     renderApp(deps, '/admin');
-    expect(await screen.findByText('LOGIN SCREEN')).toBeInTheDocument();
+    // OSP-71: web rolü olan ama /admin'e yetkisi olmayan kullanıcı artık /login'e değil, kendi ana
+    // sayfasına (/dashboard) gider ve oturumu açık kalır. Yönetici içeriği hiç görünmez.
+    expect(await screen.findByText('PANEL CONTENT')).toBeInTheDocument();
+    expect(probe()).toBe('signedIn|coordinator|/dashboard');
+    expect(screen.queryByText('ADMIN CONTENT')).not.toBeInTheDocument();
     expect(deps.forceSignOut).not.toHaveBeenCalled();
   });
 
@@ -506,6 +516,386 @@ describe('AuthProvider with blocked storage (R11)', () => {
     renderApp(deps);
     await waitFor(() => expect(probe()).toBe('signedIn|coordinator|/dashboard'));
     expect(screen.getByText('PANEL CONTENT')).toBeInTheDocument();
+  });
+});
+
+// OSP-71 (AC-19): periyodik, focus ve kurtarma / panele geçiş sonrası GET /auth/me kontrolleri.
+// Sahte zamanlayıcılar `shouldAdvanceTime` OLMADAN kullanılır: zaman yalnızca testin ilerlettiği
+// kadar akar, yavaş CI'da da sonuç belirleyicidir. Bu yüzden waitFor/findBy (gerçek zamanlı
+// yoklama) yerine `flush()` ile bekleyen promise'ler boşaltılır. `now` da sahte saatten (Date.now)
+// okunur ki throttle ile periyot aynı saati paylaşsın.
+describe('AuthProvider: periodic /auth/me check (OSP-71)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // Sahte zamanı ilerletir ve React güncellemelerini/promise'leri boşaltır.
+  async function elapse(ms: number) {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ms);
+    });
+  }
+
+  // Zaman ilerletmeden bekleyen promise zincirlerini ve 0 ms'lik zamanlayıcıları boşaltır.
+  async function flush() {
+    for (let i = 0; i < 5; i += 1) await elapse(0);
+  }
+
+  // Pencereye dönüşü taklit eder (window `focus`).
+  function focusWindow() {
+    act(() => {
+      window.dispatchEvent(new Event('focus'));
+    });
+  }
+
+  // Oturum açık, /dashboard'da, açılış kontrolü bitmiş bir uygulama.
+  async function startSignedIn(overrides: Partial<AuthProviderDeps> = {}) {
+    const helpers = makeAuthDeps({ now: () => Date.now(), ...overrides });
+    helpers.deps.getSession.mockResolvedValue(sessionFor('coordinator'));
+    const view = renderApp(helpers.deps);
+    await flush();
+    expect(screen.getByText('PANEL CONTENT')).toBeInTheDocument();
+    expect(helpers.deps.fetchMe).toHaveBeenCalledTimes(1);
+    return { ...helpers, view };
+  }
+
+  it('checks every 15 s while the tab is visible', async () => {
+    expect(ME_CHECK_INTERVAL_MS).toBe(15_000);
+    const { deps } = await startSignedIn();
+
+    await elapse(ME_CHECK_INTERVAL_MS - 1);
+    expect(deps.fetchMe).toHaveBeenCalledTimes(1);
+    await elapse(1);
+    expect(deps.fetchMe).toHaveBeenCalledTimes(2);
+    await elapse(ME_CHECK_INTERVAL_MS);
+    expect(deps.fetchMe).toHaveBeenCalledTimes(3);
+    await elapse(ME_CHECK_INTERVAL_MS);
+    expect(deps.fetchMe).toHaveBeenCalledTimes(4);
+  });
+
+  it('also checks periodically under StrictMode, without double requests', async () => {
+    const { deps } = makeAuthDeps({ now: () => Date.now() });
+    deps.getSession.mockResolvedValue(sessionFor('coordinator'));
+    renderApp(deps, '/dashboard', true);
+    await flush();
+    expect(deps.fetchMe).toHaveBeenCalledTimes(1);
+    await elapse(ME_CHECK_INTERVAL_MS);
+    expect(deps.fetchMe).toHaveBeenCalledTimes(2);
+  });
+
+  it('applies a changed server role from a periodic check', async () => {
+    const { deps } = await startSignedIn();
+    expect(probe()).toBe('signedIn|coordinator|/dashboard');
+
+    // Yönetici kullanıcının rolünü değiştirdi: bir sonraki periyodik kontrol yeni rolü uygular.
+    deps.fetchMe.mockResolvedValue({
+      ok: true,
+      status: 200,
+      data: { user_id: 'user-1', role: 'administrator', device_id: 'dev-1' },
+    });
+    await elapse(ME_CHECK_INTERVAL_MS);
+    expect(deps.fetchMe).toHaveBeenCalledTimes(2);
+    expect(probe()).toBe('signedIn|administrator|/dashboard');
+    expect(renderedAuth().role).toBe('administrator');
+  });
+
+  it('does not check while the tab is hidden and checks at once when it is visible again', async () => {
+    const { deps } = await startSignedIn();
+
+    act(() => setVisibility('hidden'));
+    await elapse(60_000);
+    expect(deps.fetchMe).toHaveBeenCalledTimes(1);
+
+    act(() => setVisibility('visible'));
+    expect(deps.fetchMe).toHaveBeenCalledTimes(2);
+
+    // Periyot görünür olma anından yeniden başlar.
+    await elapse(ME_CHECK_INTERVAL_MS - 1);
+    expect(deps.fetchMe).toHaveBeenCalledTimes(2);
+    await elapse(1);
+    expect(deps.fetchMe).toHaveBeenCalledTimes(3);
+  });
+
+  it('checks on window focus, at most once per 10 s, and restarts the period', async () => {
+    const { deps } = await startSignedIn();
+
+    // Açılış kontrolünün hemen ardından: throttle (10 sn) nedeniyle istek yok.
+    focusWindow();
+    expect(deps.fetchMe).toHaveBeenCalledTimes(1);
+
+    await elapse(ME_CHECK_MIN_INTERVAL_MS - 1);
+    focusWindow();
+    expect(deps.fetchMe).toHaveBeenCalledTimes(1);
+
+    await elapse(1);
+    focusWindow();
+    expect(deps.fetchMe).toHaveBeenCalledTimes(2);
+    await flush();
+
+    // Pencereye dönüşte focus + visibilitychange birlikte gelir: tek istek.
+    focusWindow();
+    act(() => setVisibility('visible'));
+    expect(deps.fetchMe).toHaveBeenCalledTimes(2);
+
+    // Bir sonraki periyodik kontrol focus kontrolünden 15 sn sonradır.
+    await elapse(ME_CHECK_INTERVAL_MS - 1);
+    expect(deps.fetchMe).toHaveBeenCalledTimes(2);
+    await elapse(1);
+    expect(deps.fetchMe).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not check on /login (periodic, focus or visibility)', async () => {
+    const { deps } = makeAuthDeps({ now: () => Date.now() });
+    deps.getSession.mockResolvedValue(sessionFor('coordinator'));
+    renderApp(deps, '/login');
+    await flush();
+    expect(probe()).toBe('signedIn|coordinator|/login');
+
+    await elapse(60_000);
+    focusWindow();
+    act(() => setVisibility('visible'));
+    expect(deps.fetchMe).not.toHaveBeenCalled();
+  });
+
+  it('does not check in mock mode', async () => {
+    const { deps } = makeAuthDeps({ mode: 'mock', now: () => Date.now() });
+    deps.getSession.mockResolvedValue(sessionFor('coordinator'));
+    renderApp(deps);
+    await flush();
+    expect(screen.getByText('PANEL CONTENT')).toBeInTheDocument();
+    await elapse(60_000);
+    focusWindow();
+    expect(deps.fetchMe).not.toHaveBeenCalled();
+  });
+
+  it('stops after a sign-out', async () => {
+    const { deps, emit } = await startSignedIn();
+    act(() => emit('SIGNED_OUT', null));
+    await elapse(60_000);
+    focusWindow();
+    expect(deps.fetchMe).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops after unmount', async () => {
+    const { deps, view } = await startSignedIn();
+    view.unmount();
+    await elapse(60_000);
+    expect(deps.fetchMe).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('does not check while this session\'s logout is pending', async () => {
+    const { deps } = await startSignedIn();
+    deps.callLogoutEndpoint.mockReturnValue(new Promise(() => undefined)); // hiç cevap vermez
+    deps.signOut.mockReturnValue(new Promise(() => undefined)); // çıkış hiç bitmez
+    void renderedAuth().logout();
+    await elapse(ME_CHECK_INTERVAL_MS * 2);
+    focusWindow();
+    expect(deps.fetchMe).toHaveBeenCalledTimes(1);
+  });
+
+  it('never has two checks in flight', async () => {
+    const { deps } = makeAuthDeps({ now: () => Date.now() });
+    deps.getSession.mockResolvedValue(sessionFor('coordinator'));
+    deps.fetchMe.mockReturnValue(new Promise(() => undefined)); // hiç cevap vermez
+    renderApp(deps);
+    await flush();
+    expect(deps.fetchMe).toHaveBeenCalledTimes(1);
+
+    await elapse(ME_CHECK_INTERVAL_MS * 4);
+    focusWindow();
+    act(() => setVisibility('visible'));
+    expect(deps.fetchMe).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the session when the periodic check fails transiently (429, 503, timeout, network)', async () => {
+    const { deps } = await startSignedIn();
+    deps.fetchMe
+      .mockResolvedValueOnce({ ok: false, error: { kind: 'RATE_LIMITED', status: 429 } } as never)
+      .mockResolvedValueOnce({ ok: false, error: { kind: 'SERVER_ERROR', status: 503 } } as never)
+      .mockResolvedValueOnce({ ok: false, error: { kind: 'TIMEOUT' } } as never)
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    await elapse(ME_CHECK_INTERVAL_MS * 4);
+    expect(deps.fetchMe).toHaveBeenCalledTimes(5);
+    expect(screen.getByText('PANEL CONTENT')).toBeInTheDocument();
+    expect(probe()).toBe('signedIn|coordinator|/dashboard');
+    expect(deps.forceSignOut).not.toHaveBeenCalled();
+    expect(deps.signOut).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+});
+
+describe('AuthProvider: check after recovery / moving on to the panel (OSP-71)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function elapse(ms: number) {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ms);
+    });
+  }
+
+  // Zaman ilerletmeden bekleyen promise zincirlerini ve 0 ms'lik zamanlayıcıları boşaltır.
+  async function flush() {
+    for (let i = 0; i < 5; i += 1) await elapse(0);
+  }
+
+  // /login'deki giriş tamamlanınca panele geçişi taklit eden basit sayfa.
+  function LoginStub() {
+    const navigate = useNavigate();
+    return (
+      <button type="button" onClick={() => navigate('/dashboard', { replace: true })}>
+        GO PANEL
+      </button>
+    );
+  }
+
+  function renderWithRoutes(deps: AuthProviderDeps, path: string) {
+    return render(
+      <MemoryRouter initialEntries={[path]}>
+        <AuthProvider deps={deps}>
+          <Probe />
+          <Routes>
+            <Route path="/login" element={<LoginStub />} />
+            <Route path="/open" element={<p>OPEN PAGE</p>} />
+            <Route
+              path="/dashboard"
+              element={
+                <RequireRole action="viewOperations">
+                  <p>PANEL CONTENT</p>
+                </RequireRole>
+              }
+            />
+          </Routes>
+        </AuthProvider>
+      </MemoryRouter>,
+    );
+  }
+
+  it('checks once when a TOKEN_REFRESHED ends the startup recovery (R4)', async () => {
+    const { deps, emit } = makeAuthDeps({ now: () => Date.now() });
+    deps.getSession.mockRejectedValue(new Error('offline'));
+    renderWithRoutes(deps, '/dashboard');
+    await flush();
+    expect(screen.getByText('Sunucuya ulaşılamıyor. Yeniden deneniyor…')).toBeInTheDocument();
+    expect(deps.fetchMe).not.toHaveBeenCalled();
+
+    act(() => emit('TOKEN_REFRESHED', sessionFor('coordinator')));
+    await flush();
+    expect(screen.getByText('PANEL CONTENT')).toBeInTheDocument();
+    expect(deps.fetchMe).toHaveBeenCalledTimes(1);
+
+    // Aynı oturumun sonraki olağan yenilemeleri ek istek açmaz.
+    act(() => emit('TOKEN_REFRESHED', sessionFor('coordinator', 'user-1', 'r2')));
+    await flush();
+    expect(deps.fetchMe).toHaveBeenCalledTimes(1);
+  });
+
+  it('clears the deferred recovery check on unmount', async () => {
+    const { deps, emit } = makeAuthDeps({ now: () => Date.now() });
+    deps.getSession.mockRejectedValue(new Error('offline'));
+    const view = renderWithRoutes(deps, '/dashboard');
+    await flush();
+
+    // TOKEN_REFRESHED ertelenmiş (0 ms) kontrolü kurar; zamanlayıcı çalışmadan unmount edilir.
+    act(() => {
+      emit('TOKEN_REFRESHED', sessionFor('coordinator'));
+      view.unmount();
+    });
+    expect(vi.getTimerCount()).toBe(0);
+    await elapse(60_000);
+    expect(deps.fetchMe).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['still loading at startup', () => new Promise<never>(() => undefined)],
+    ['waiting for Supabase (R4)', () => Promise.reject(new Error('offline'))],
+  ])(
+    'a SIGNED_IN broadcast to a panel tab that is %s does not check at once (no SESSION_NOT_BOUND race)',
+    async (_label, getSession) => {
+      const { deps, emit } = makeAuthDeps({ now: () => Date.now() });
+      deps.getSession.mockImplementation(getSession);
+      renderWithRoutes(deps, '/dashboard');
+      await flush();
+      expect(probe()).toBe('loading|-|/dashboard');
+
+      // Başka sekmedeki giriş: o sekmenin POST /auth/session'ı henüz bitmemiş olabilir.
+      act(() => emit('SIGNED_IN', sessionFor('coordinator')));
+      await flush();
+      expect(screen.getByText('PANEL CONTENT')).toBeInTheDocument();
+      expect(deps.fetchMe).not.toHaveBeenCalled();
+
+      // Oturum yine de doğrulanır: periyodik kontrolle.
+      await elapse(ME_CHECK_INTERVAL_MS);
+      expect(deps.fetchMe).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('does not check on a SIGNED_IN outside the panel either; the period covers it', async () => {
+    const { deps, emit } = makeAuthDeps({ now: () => Date.now() });
+    renderWithRoutes(deps, '/open');
+    await flush();
+    expect(probe()).toBe('signedOut|-|/open');
+
+    act(() => emit('SIGNED_IN', sessionFor('coordinator')));
+    await flush();
+    expect(deps.fetchMe).not.toHaveBeenCalled();
+    await elapse(ME_CHECK_INTERVAL_MS);
+    expect(deps.fetchMe).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not check during the sign-in on /login, but once when moving on to the panel', async () => {
+    const { deps, emit } = makeAuthDeps({ now: () => Date.now() });
+    renderWithRoutes(deps, '/login');
+    await flush();
+    expect(probe()).toBe('signedOut|-|/login');
+
+    act(() => emit('SIGNED_IN', sessionFor('coordinator')));
+    await flush();
+    expect(deps.fetchMe).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'GO PANEL' }));
+    await flush();
+    expect(screen.getByText('PANEL CONTENT')).toBeInTheDocument();
+    expect(deps.fetchMe).toHaveBeenCalledTimes(1);
+  });
+
+  it('a different session signed in within 10 s is checked at once; the same session is throttled', async () => {
+    const { deps, emit } = makeAuthDeps({ now: () => Date.now() });
+    deps.getSession.mockResolvedValue(sessionFor('coordinator', 'user-a'));
+    renderWithRoutes(deps, '/dashboard');
+    await flush();
+    expect(deps.fetchMe).toHaveBeenCalledTimes(1);
+
+    // Aynı sekmede çıkış ve 10 sn dolmadan FARKLI bir oturumla giriş: throttle atlanır.
+    await elapse(1_000);
+    act(() => emit('SIGNED_OUT', null));
+    await flush();
+    expect(probe()).toBe('signedOut|-|/login');
+    act(() => emit('SIGNED_IN', sessionFor('coordinator', 'user-b')));
+    fireEvent.click(screen.getByRole('button', { name: 'GO PANEL' }));
+    await flush();
+    expect(screen.getByText('PANEL CONTENT')).toBeInTheDocument();
+    expect(deps.fetchMe).toHaveBeenCalledTimes(2);
+
+    // Karşılaştırma: AYNI oturum 10 sn içinde tekrar panele gelirse throttle uygulanır.
+    await elapse(1_000);
+    act(() => emit('SIGNED_OUT', null));
+    await flush();
+    act(() => emit('SIGNED_IN', sessionFor('coordinator', 'user-b')));
+    fireEvent.click(screen.getByRole('button', { name: 'GO PANEL' }));
+    await flush();
+    expect(screen.getByText('PANEL CONTENT')).toBeInTheDocument();
+    expect(deps.fetchMe).toHaveBeenCalledTimes(2);
   });
 });
 
