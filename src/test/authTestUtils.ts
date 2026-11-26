@@ -23,6 +23,8 @@ export function sessionFor(
   return { access_token: tokenFor(claims), user: { id: userId } } as unknown as Session;
 }
 
+export const TEST_AUTH_STORAGE_KEY = 'sb-test-auth-token';
+
 type Listener = (event: AuthChangeEvent, session: Session | null) => void;
 
 /**
@@ -54,6 +56,8 @@ export function makeAuthDeps(overrides: Partial<AuthProviderDeps> = {}) {
     markSessionEnded: vi.fn<AuthProviderDeps['markSessionEnded']>(),
     clearSessionEnded: vi.fn<AuthProviderDeps['clearSessionEnded']>(),
     storedSessionKey: vi.fn<AuthProviderDeps['storedSessionKey']>(() => null),
+    // OSP-72 (R21): key watched for cross-tab sign-outs (StorageEvent tests dispatch this key).
+    authStorageKey: TEST_AUTH_STORAGE_KEY as string | undefined,
     setLoginNavigator: vi.fn<AuthProviderDeps['setLoginNavigator']>(() => () => undefined),
     storage: () => window.localStorage,
     mode: 'real' as string | undefined,

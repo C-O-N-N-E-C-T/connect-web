@@ -14,6 +14,7 @@ import { decodeJwtClaims, readSessionKey, readUserRole } from '../lib/jwt';
 import { isWebRole, type AppRole } from '../lib/roles';
 import type { ApiErrorKind, ApiResult, TransientKind } from '../services/apiClient';
 import type { ForceSignOut } from './forcedSignOut';
+import { sessionKeyFromStoredValue } from './storedSession';
 import {
   ANY_SESSION,
   clearLogoutPending,
@@ -107,6 +108,11 @@ export interface AuthProviderDeps {
   clearSessionEnded(sessionKey: string | null): void;
   /** Identity of the session persisted by supabase-js, read without any network call. */
   storedSessionKey(): string | null;
+  /**
+   * OSP-72 (R21): localStorage key of the persisted supabase-js session. When set, `storage`
+   * events for it (another tab removed or replaced the session) end this tab's session locally.
+   */
+  authStorageKey?: string;
   setLoginNavigator(navigateToLogin: () => void): () => void;
   /** localStorage (holds the logout-pending flag), or null when storage is blocked. */
   storage(): Storage | null;
@@ -314,6 +320,53 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
   }, [roleOf]);
 
   /**
+   * OSP-72 (R21): the persisted session was removed or replaced outside this tab (another tab's
+   * logout, including the 3 s fallback that removes the session itself, or a new sign-in there).
+   * Ends `ended`'s session in THIS tab's UI only: no POST /auth/logout and no supabase-js
+   * `signOut` (both already happened in the other tab, and a `signOut` here could revoke a session
+   * stored meanwhile, see R20). The session is marked as ended, so late API responses of it are
+   * SESSION_CHANGED and never sign anyone out (R2).
+   * - `next === null` (no session stored any more): signed out, the route guard shows /login.
+   * - another session stored: show nothing of the old one ("loading"), then read and apply the new
+   *   session; its role is confirmed again by GET /auth/me before /admin opens (OSP-71).
+   */
+  /** OSP-72 (R21): `guardedCheck(false)`, set once it is defined below. */
+  const recheckRef = useRef<(() => void) | null>(null);
+  const endSessionLocally = useCallback(
+    (ended: Session, next: string | null) => {
+      const d = depsRef.current;
+      if (sessionRef.current !== ended) return;
+      d.markSessionEnded(sessionKeyOf(ended));
+      if (next === null) {
+        applySession(null);
+        return;
+      }
+      sessionRef.current = null;
+      serverRoleRef.current = null;
+      roleCheckRef.current = null;
+      setState(LOADING);
+      void d.getSession().then(
+        (session) => {
+          // A session event from supabase-js may have applied a session meanwhile: keep it.
+          if (sessionRef.current) return;
+          // The new session is itself being logged out: signed out here too (UI only, no call).
+          // Returning instead would leave this tab on "loading" with no session to watch.
+          if (session && isLogoutPending(d.storage(), sessionKeyOf(session))) {
+            applySession(null);
+            return;
+          }
+          applySession(session);
+          if (session) recheckRef.current?.();
+        },
+        // Transient failure: the old session is gone anyway; sign in again rather than wait.
+        () => {
+          if (!sessionRef.current) applySession(null);
+        },
+      );
+    },
+    [applySession],
+  );
+  /**
    * GET /api/v1/auth/me — the user's "option 2" decision (design D3): this lightweight endpoint
    * is the session check of the web dashboard, so AC-19 ("the very next API call signs the user
    * out") is observable even though the panels make no backend calls yet. We deliberately do NOT
@@ -374,6 +427,16 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
         return;
       }
       if (!result.ok) {
+        // OSP-72 (R21): UNAUTHENTICATED = the API client found no stored session at all (it
+        // refreshes / signs out on a 401 itself). The session was removed outside this tab and
+        // no `storage` event reached us (e.g. it was missed): end it locally, without any call.
+        if (result.error.kind === 'UNAUTHENTICATED') {
+          const current = sessionRef.current;
+          if (current && startedFor !== null && sessionKeyOf(current) === startedFor && !isLogoutPending(d.storage(), startedFor)) {
+            endSessionLocally(current, null);
+          }
+          return;
+        }
         // OSP-71: geçici hata (ağ, TIMEOUT, 5xx, 429) -> `unreachable`. Geçici olmayan bir sonuç
         // (HTTP_ERROR, FORBIDDEN, SESSION_CHANGED vb.) -> `failed`: sunucuya ulaşıldı ama rol
         // onaylanamadı. Kesin red (401/403 -> zorla çıkış) apiClient'ta eskisi gibi ele alınır; o
@@ -427,7 +490,7 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
     });
     meInFlightRef.current.set(startedFor, tracked);
     return tracked;
-  }, []);
+  }, [endSessionLocally]);
 
   /**
    * OSP-71: açılış dışındaki tüm kontrol yollarının (visibility, focus, periyodik, giriş /
@@ -456,6 +519,7 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
     },
     [checkMe],
   );
+  recheckRef.current = () => guardedCheck(false);
 
   const runLogout = useCallback((timeoutMs: number, sessionKey: string | null): Promise<void> => {
     if (logoutInFlightRef.current) return logoutInFlightRef.current;
@@ -584,6 +648,29 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
       unsubscribe();
     };
   }, [applySession, checkMe, guardedCheck, runLogout]);
+
+  // OSP-72 (R21): another tab removed or replaced the persisted session. supabase-js broadcasts
+  // its own sign-outs, but not the app's 3 s fallback removal (authRuntime.signOutLocal), so
+  // without this the other tab kept showing the panel (and admin data) until its next API call.
+  // Browsers fire `storage` only in OTHER tabs, never in the tab that wrote. A token refresh
+  // of the same session (same identity) is ignored.
+  useEffect(() => {
+    const key = depsRef.current.authStorageKey;
+    if (!key) return;
+    const onStorage = (event: StorageEvent) => {
+      const d = depsRef.current;
+      // `key === null`: storage.clear() in another tab.
+      if (event.key !== null && event.key !== key) return;
+      if (event.storageArea && event.storageArea !== d.storage()) return;
+      const current = sessionRef.current;
+      if (!current) return; // already signed out; a new sign-in arrives via onAuthStateChange
+      const next = event.key === null ? null : sessionKeyFromStoredValue(event.newValue);
+      if (next !== null && next === sessionKeyOf(current)) return;
+      endSessionLocally(current, next);
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, [endSessionLocally]);
 
   // Forced sign-outs navigate through the router.
   useEffect(

@@ -123,7 +123,7 @@ The login form validates the email format and that the password is not empty bef
 - The role starts as the JWT `user_role` claim. `GET /api/v1/auth/me` then returns the role from the database, and **the server role wins**. A non-web role (`rescuer`) is signed out with `ROLE_NOT_ALLOWED`.
 - `GET /api/v1/auth/me` runs once on start (when there is a session), every 15 s while signed in and the tab is visible (OSP-71), when the tab becomes visible again (`visibilitychange`) or the window gets focus (`focus`), and once after a sign-in: after a `SIGNED_IN` (or a `TOKEN_REFRESHED` that ends the startup wait, R4) outside `/login`, and when the user moves from `/login` to a panel. The 15 s timer stops while the tab is hidden; on return the visibility check runs at once and the period restarts. Every check restarts the period. A check already in flight is reused (never two at once), and a visibility, focus or post-sign-in check is skipped if the last check for the same session started less than 10 s ago. It is not called on `/login` (start, timer, visibility, focus) because a sign-in may be in progress there (R12), nor in `mock` mode, nor while a logout is pending. An answer is applied only to the session and user that asked (R2).
 - The panel renders with the JWT role right away. It does not wait for `/auth/me`, and corrects the role (or signs out) when the answer arrives.
-- Why `/auth/me` and not an existing endpoint: the panels make no backend calls yet, so a revoked device would otherwise only be noticed later. `GET /api/v1/victims` writes an audit row on every call (OSP-65) and downloads sensitive data, so it is not used as a ping.
+- Why `/auth/me` and not an existing endpoint: the coordinator panel makes no backend calls yet (and the admin panel only on its own screens), so a revoked device would otherwise only be noticed later. `GET /api/v1/victims` writes an audit row on every call (OSP-65) and downloads sensitive data, so it is not used as a ping.
 - `RequireRole` uses `useAuth()`. It shows "Yükleniyor…" while the status is `loading`, and still re-checks the session when a page is restored from the back/forward cache.
 
 ### API client
@@ -170,11 +170,33 @@ Every sign-out in the web app uses `scope: 'local'`. With the default `global` s
 
 - The `connect.logout_pending` flag is **not** a security control. Someone who controls the browser can block `/auth/logout`, delete the flag or copy the token, but they only keep their own session, which they could also do by not pressing logout. Enforcement happens on the server: the OSP-61 guard checks every request (`DEVICE_REVOKED` / `ACCOUNT_DISABLED`), access tokens expire (~1 h), and refresh tokens can be revoked.
 - **Abandoned `signOut` can end the next user's session (R20, accepted, no code change).** If `signOut` does not finish within 3 s (stored token within about 90 s of expiry and a flaky network), the app removes the session itself and shows `/login`, but supabase-js keeps going. When it finishes, it signs out and revokes whatever session is stored then, for example the next user's, in this or another tab. No data is exposed; the next user has to sign in again. It needs the token near expiry, a flaky connection at logout and a new sign-in before the old call settles (up to about 25 s with fast-failing requests, longer if the socket hangs until the browser's TCP timeout). A fix is to stop calling the SDK `signOut` on that path and remove the session, broadcast the sign-out and revoke it with `admin.signOut(token, 'local')` ourselves.
-- **Other tabs are not told after the 3 s fallback (R21, accepted, no code change).** The app's own removal is not broadcast, so another open tab keeps showing the panel until its next API call (forced sign-out with "Oturumunuzun süresi doldu") or a reload; the `/auth/me` checks (periodic, focus, tab-visible) ignore the no-session case. The panels are placeholders today, so nothing is shown. This must be fixed before panels show data, for example by listening to `storage` events for the Supabase auth key in `AuthProvider`.
+- **Other tabs after the 3 s fallback (R21, fixed in OSP-72).** The app's own removal of the session is not broadcast by supabase-js, so `AuthProvider` listens to `storage` events for the Supabase auth key (`authStorageKey` dependency, `SUPABASE_AUTH_STORAGE_KEY` in the app). When another tab removes the session (or clears the storage), this tab marks the session as ended and signs out in its UI only, and the route guard shows `/login`. It does not call `/auth/logout` or the supabase-js `signOut` again, so nothing is revoked twice and a session stored meanwhile is never touched (R20). A token refresh of the same session is ignored. If a different session is stored instead (a sign-in in another tab), the old session's content is hidden at once, the new session is read and applied, and `/admin` waits for `GET /auth/me` to confirm the new role again. As a fallback, a `/auth/me` check (periodic, focus, visibility) that finds no stored session (`UNAUTHENTICATED`) also signs out locally. Remaining limits: browsers deliver `storage` events only between tabs that share the same `localStorage`; with blocked storage supabase-js keeps the session in memory per tab, so there is nothing to sync.
 - The `LOGOUT` audit row is written only when the client reaches `/auth/logout`, so it can be suppressed.
 - If `/auth/logout` did not succeed, a copied access token stays usable at the backend until it expires.
 - A revoked device is noticed on the next backend call: on start, within 15 s while the tab is visible (periodic `/auth/me`), when the tab becomes visible again or the window gets focus, after a sign-in, or on any later API call. A hidden tab makes no checks, so it is signed out only when it is shown again.
 - `/api/v1/auth/*` is rate-limited to 10 requests per minute per IP, but the backend exempts `GET /api/v1/auth/me` (team decision, backend branch `OSP-70`), so the periodic, visibility and focus checks do not use up the login/logout budget of users behind the same NAT. Rebind (`POST /auth/session`) and logout still count. A 429 is a typed error and does not sign the user out.
+
+## Administration (OSP-72)
+
+The administrator panel (`/admin/*`, behind `RequireRole action="admin" requireConfirmedRole`, OSP-71) uses the OSP-66 admin API (`connect-backend` `src/routes/admin.ts`, `docs/osp-66-admin-api.md`). The page title stays "Yönetici Paneli" on every sub-route.
+
+| Route | Screen | Endpoints |
+| --- | --- | --- |
+| `/admin` | redirects to `/admin/users` (replace) | |
+| `/admin/users?page=N` | user list, "Yeni kullanıcı" dialog | `GET /api/v1/admin/users`, `POST /api/v1/admin/users` |
+| `/admin/users/:userId` | devices and account actions | `GET /api/v1/admin/users/:id/devices`, `POST …/devices/:deviceId/revoke`, `POST …/revoke-all`, `POST …/reactivate` |
+| `/admin/audit-logs?…` | audit log with filters | `GET /api/v1/admin/audit-logs` |
+| any other `/admin/…` | redirects to `/admin/users` (replace) | |
+
+- **Actions (Turkish UI, Jira wording).** "Yalnızca bu cihazı iptal et" = Revoke This Device Only; "Hesabı devre dışı bırak ve tüm oturumları kapat" = Disable Account & Revoke All Sessions; "Hesabı yeniden etkinleştir" = Reactivate Account. Each has its own confirmation dialog (`role="alertdialog"`, focus on "Vazgeç", different title, text and button label). The global revoke also needs an acknowledgement checkbox before its button is enabled. A backdrop click never closes a dialog; Escape does, except while the request runs. After a successful action focus moves to the section heading (the button that opened the dialog is replaced). On the administrator's own account, the device this browser uses (`connect.device_id`) is marked "(bu cihaz)" and its revoke dialog warns that the current session ends at once. A device revoke answered 404 keeps the error in the dialog and reloads the device list.
+- **Self-protection.** The global revoke button is disabled on the administrator's own account ("Kendi hesabınızı devre dışı bırakamazsınız."); the backend's 409 shows the same message.
+- **Create user.** Only `rescuer` and `coordinator` accounts can be created: the role select offers only these (`CreatableRole`), `createAdminApi().createUser` throws before any request for another role, and the backend answers 403 for `administrator`. The form checks name (1–100), e-mail and the temporary password (10–72) before sending; a duplicate e-mail (409) is shown on the e-mail field, a 500 is explained as a possible password-rule failure.
+- **Paging.** 25 rows per page. The backend returns no total, so the app requests `limit=26` and shows a "Sonraki" button only when the 26th row exists. The page is in the URL (`?page=N`, omitted for page 1); an invalid value is removed with a replace navigation.
+- **Audit filters.** `action_type`, `actor_user_id`, `target_record_id` (UUID), `from`, `to` live in the URL and are written only when "Filtrele" is pressed (page reset to 1). "Başlangıç (UTC)" / "Bitiş (UTC)" are `datetime-local` inputs read as **UTC**; `from` is inclusive from the start of the minute, `to` inclusive to its last microsecond (`…:59.999999Z`; Postgres stores microseconds). Invalid URL params (unknown action type, non-UUID ids, times not ISO with `Z` or dates that do not exist such as `2026-02-30` or `T24:00`, `to` before `from`) are dropped.
+- **Timestamps** are always shown as `YYYY-MM-DD HH:mm:ss UTC`.
+- **Errors.** Admin pages call `useAdminApi()` (injected through `AdminApiProvider`, real instance `adminApi` in `src/auth/authRuntime.ts`) and only map the typed result to text (`src/admin/adminErrors.ts`). 401 refresh, `SESSION_NOT_BOUND` re-bind and the forced sign-out on `DEVICE_REVOKED` / `ACCOUNT_DISABLED` stay in the API client; `SIGNED_OUT` and `SESSION_CHANGED` show nothing.
+- **User summary.** The user page takes the name and status from the list row it was opened from. Opened directly (bookmark, reload), it scans the user list (100 per request, at most 1000 users) because the backend has no single-user endpoint.
+- **Mock mode.** `VITE_AUTH_SESSION_MODE=mock` does not mock the admin API; the screens need the backend. In mock mode the session is never bound to a device, so admin calls would fail with `SESSION_NOT_BOUND` and sign the user out. The panel therefore makes no admin call and shows a hint to set `VITE_AUTH_SESSION_MODE=real` and restart `npm run dev`.
 
 ## Project structure
 
@@ -192,8 +214,18 @@ src/
     logout.ts              logout flow with the pending flag
     login.ts               login flow (dependency-injected, unit tested)
     RequireRole.tsx        route guard by role
+    storedSession.ts       identity of a persisted supabase-js session value (R21 cross-tab sign-out)
+  admin/                   OSP-72 admin helpers
+    AdminApiContext.tsx    AdminApiProvider / useAdminApi()
+    adminErrors.ts         ApiError -> Turkish message per action
+    auditFilters.ts        audit filters <-> URL and form draft
+    pagination.ts          25 per page, limit 26 for "has next"
+    labels.ts              role and action-type labels
+    StatusPill.tsx         account status badge
   components/
-    AppLayout.tsx          shared shell for panel pages (includes disclaimer)
+    AppLayout.tsx          shared shell for panel pages (includes disclaimer; `wide` for admin tables)
+    Dialog.tsx, ConfirmDialog.tsx   accessible modal and confirmation (OSP-72)
+    Pagination.tsx         previous / next pager (OSP-72)
     SupplementaryDisclaimer.tsx   required safety notice (NFR-SAFE-03)
     SeismographBackground.tsx     decorative login background
     BrandMark.tsx, icons.tsx
@@ -203,12 +235,15 @@ src/
     storage.ts             Web Storage access that never throws (storage may be blocked)
     deadline.ts            promise deadline helper
     roles.ts               web roles and routing
+    formatUtc.ts           UTC timestamp formatting and datetime-local conversion (OSP-72)
   pages/
     LoginPage.tsx
     CoordinatorDashboard.tsx   placeholder
-    AdminPage.tsx              placeholder
+    AdminPage.tsx              administrator panel shell and sub-routes (OSP-72)
+    admin/                     UsersPage, CreateUserDialog, UserDevicesPage, AuditLogPage
   services/
     apiClient.ts           backend API client with unified 401/403 handling
+    adminApi.ts            typed OSP-66 admin API client (OSP-72)
     authSessionClient.ts   backend session registration (mock or real)
     deviceId.ts            per-browser device id in localStorage
 ```
@@ -219,7 +254,7 @@ src/
 npm test
 ```
 
-Tests cover the login flow and error mapping, role routing, JWT claim reading, the session client, the API client error table, forced sign-out, the AuthProvider (reload, `/auth/me`, interrupted logout), the logout flow, the revocation scenario (AC-19), and the login and panel screens. Tests use a fixed test environment defined in `vite.config.ts`, so they do not need a real `.env`.
+Tests cover the login flow and error mapping, role routing, JWT claim reading, the session client, the API client error table, forced sign-out, the AuthProvider (reload, `/auth/me`, interrupted logout), the logout flow, the revocation scenario (AC-19), the cross-tab sign-out (R21), the login and panel screens, and the administrator screens (admin API client, error mapping, paging, audit filters, dialogs, user list, create user, devices and account actions, audit log). Admin page tests use a fake `AdminApi` (`src/test/adminTestUtils.tsx`). Tests use a fixed test environment defined in `vite.config.ts`, so they do not need a real `.env`.
 
 ## Conventions
 
@@ -233,4 +268,5 @@ Tests cover the login flow and error mapping, role routing, JWT claim reading, t
 - Login, role-based routing, and the rescuer rejection are implemented.
 - Backend session registration uses the OSP-60 endpoint (`real` mode by default).
 - Session handling (AuthProvider, API client, logout with `/auth/logout`) is implemented (OSP-70). `GET /api/v1/auth/me` needs the backend `OSP-70` branch.
-- Panels are placeholders. Map, records, and admin features come in later tickets.
+- The administrator panel (users, create user, device revoke, account disable / reactivate, audit log) is implemented (OSP-72) on the OSP-66 admin API.
+- The coordinator panel is a placeholder. Map and records come in later tickets.

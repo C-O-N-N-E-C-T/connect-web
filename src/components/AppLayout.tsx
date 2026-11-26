@@ -8,7 +8,16 @@ import { SupplementaryDisclaimer } from './SupplementaryDisclaimer';
  * Shared shell for every authenticated panel view. The disclaimer lives here so
  * no main view can omit it (AC-29: 100% of main layout views).
  */
-export function AppLayout({ title, children }: { title: string; children?: ReactNode }) {
+export function AppLayout({
+  title,
+  wide = false,
+  children,
+}: {
+  title: string;
+  /** OSP-72: wider container for the admin tables. */
+  wide?: boolean;
+  children?: ReactNode;
+}) {
   const navigate = useNavigate();
   const { logout } = useAuth();
   const [loggingOut, setLoggingOut] = useState(false);
@@ -40,7 +49,7 @@ export function AppLayout({ title, children }: { title: string; children?: React
   }
 
   return (
-    <main>
+    <main className={wide ? 'main-wide' : undefined}>
       <header>
         <h1>{title}</h1>
         <button type="button" onClick={handleLogout} disabled={loggingOut}>

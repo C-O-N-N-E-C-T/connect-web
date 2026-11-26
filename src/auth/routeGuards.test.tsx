@@ -12,6 +12,8 @@ import { AuthProvider, ME_CHECK_INTERVAL_MS, useAuth, type AuthProviderDeps } fr
 import { createForcedSignOut } from './forcedSignOut';
 import { resetEndedSessions } from './endedSessions';
 import { makeAuthDeps, sessionFor, tokenFor } from '../test/authTestUtils';
+import { AdminApiProvider } from '../admin/AdminApiContext';
+import { makeAdminApi } from '../test/adminTestUtils';
 import type { Session } from '@supabase/supabase-js';
 
 vi.mock('../lib/supabase', () => ({
@@ -66,9 +68,12 @@ function renderAt(deps: AuthProviderDeps, path: string, strict = false, extra: R
   const tree = (
     <MemoryRouter initialEntries={[path]}>
       <AuthProvider deps={deps}>
-        <Probe />
-        {extra}
-        <AppRoutes />
+        {/* OSP-72: the admin pages read their API from context (fake, never answers with data). */}
+        <AdminApiProvider api={makeAdminApi()}>
+          <Probe />
+          {extra}
+          <AppRoutes />
+        </AdminApiProvider>
       </AuthProvider>
     </MemoryRouter>
   );
@@ -258,9 +263,11 @@ describe('administrator on /admin/* waits for the server role', () => {
 
     await me.answer(meAnswer('administrator'));
     expect(await screen.findByRole('heading', { name: 'Yönetici Paneli' })).toBeInTheDocument();
-    expect(pathname()).toBe(path);
+    // OSP-72: /admin redirects to the user list.
+    expect(pathname()).toBe('/admin/users');
     expect(probe()).toContain('|confirmed');
-    expect(screen.queryByText('Yükleniyor…')).not.toBeInTheDocument();
+    // The user list loads (fake API) and its own "Yükleniyor…" goes away too.
+    await waitFor(() => expect(screen.queryByText('Yükleniyor…')).not.toBeInTheDocument());
   });
 
   it('does not open /admin when /auth/me says the user is a coordinator', async () => {
@@ -739,7 +746,7 @@ describe('/auth/me single-flight is per session', () => {
 
     await me.answer(meAnswer('administrator', 'user-b'));
     expect(await screen.findByRole('heading', { name: 'Yönetici Paneli' })).toBeInTheDocument();
-    expect(probe()).toContain('/admin|');
+    expect(probe()).toContain('/admin/users|'); // OSP-72: /admin -> /admin/users
     expect(probe()).toContain('signedIn|administrator|confirmed');
     expect(deps.forceSignOut).not.toHaveBeenCalled();
   });
