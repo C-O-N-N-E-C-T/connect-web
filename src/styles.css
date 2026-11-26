@@ -569,3 +569,40 @@ button:disabled {
   letter-spacing: 0.2em;
   margin-right: -0.2em; /* offset trailing letter-spacing so the word stays centred */
 }
+
+/* ---------- Panel: access warning, read-only label, actions (OSP-71) ---------- */
+
+/* "Bu sayfaya erişim yetkiniz yok." uyarısı; panel kenar boşluklarına hizalanır. */
+main > .panel-banner {
+  margin: 16px 28px 0;
+}
+
+/* Administrator'ın operasyonel ekranı salt okunur gördüğünü belirten etiket. */
+main > .read-only-badge {
+  display: inline-block;
+  margin: 16px 28px 0;
+  padding: 4px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: var(--color-bg);
+  color: var(--color-primary);
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+/* Override / Kaynak ata yer tutucu butonları. */
+.panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 16px 28px 0;
+}
+
+@media (max-width: 480px) {
+  main > .panel-banner,
+  main > .read-only-badge,
+  .panel-actions {
+    margin-left: 20px;
+    margin-right: 20px;
+  }
+}

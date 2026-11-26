@@ -14,7 +14,7 @@ function renderGuarded(deps: AuthProviderDeps) {
           <Route
             path="/dashboard"
             element={
-              <RequireRole allow={['coordinator', 'administrator']}>
+              <RequireRole action="viewOperations">
                 <p>PANEL CONTENT</p>
               </RequireRole>
             }
@@ -65,9 +65,13 @@ describe('RequireRole', () => {
 
   it('redirects to login for a role that is not allowed', async () => {
     const { deps } = setup();
-    deps.getSession.mockResolvedValue(sessionFor('rescuer'));
+    const session = sessionFor('rescuer');
+    deps.getSession.mockResolvedValue(session);
     renderGuarded(deps);
     expect(await screen.findByText('LOGIN SCREEN')).toBeInTheDocument();
+    // OSP-71: rescuer yalnızca yönlendirilmez, oturumu da ROLE_NOT_ALLOWED ile kapatılır.
+    expect(deps.forceSignOut).toHaveBeenCalledWith('ROLE_NOT_ALLOWED', session.access_token);
+    expect(screen.queryByText('PANEL CONTENT')).not.toBeInTheDocument();
   });
 
   it('redirects to login when the session ends (SIGNED_OUT event)', async () => {
