@@ -26,6 +26,19 @@ import {
 
 export type AuthStatus = 'loading' | 'signedIn' | 'signedOut';
 
+/**
+ * OSP-71: bu oturumun rol onayı (GET /auth/me) neden henüz gelmedi:
+ * - `pending`: bilinen bir sorun yok (kontrol bekleniyor ya da onay zaten alındı).
+ * - `unreachable`: son kontrol geçici bir hatayla bitti (ağ, TIMEOUT, 5xx, 429 ya da beklenmeyen
+ *   istisna). Periyodik / focus kontrolü yeniden dener.
+ * - `failed`: sunucuya ulaşıldı ama rol onaylanamadı (geçici olmayan hata, biçimsiz gövde vb.).
+ *   Periyodik kontrol yeniden dener.
+ * - `missingSessionId`: token'da `session_id` yok; bu oturumun rolü hiçbir zaman onaylanamaz
+ *   (yeniden giriş gerekir).
+ * Hiçbir durum oturumu kapatmaz.
+ */
+export type RoleCheckStatus = 'pending' | 'unreachable' | 'failed' | 'missingSessionId';
+
 export interface AuthState {
   status: AuthStatus;
   session: Session | null;
@@ -45,12 +58,11 @@ export interface AuthState {
    */
   roleConfirmed: boolean;
   /**
-   * OSP-71: bu oturum için son GET /auth/me geçici bir hatayla (ağ, TIMEOUT, 5xx, 429) bitti.
-   * Rol onayı bekleyen ekranlar (ör. /admin) bu sırada süresiz "Yükleniyor…" yerine bağlantı
-   * sorunu mesajını gösterir. Oturum KAPANMAZ; aynı oturum için başarılı bir /auth/me gelince,
-   * yeni oturumda ve çıkışta false'a döner.
+   * OSP-71: rol onayının durumu (bkz. `RoleCheckStatus`). Rol onayı bekleyen ekranlar (ör. /admin)
+   * süresiz "Yükleniyor…" yerine buna göre açık bir mesaj gösterir. Aynı oturumun token
+   * yenilemesinde korunur; yeni oturumda ve çıkışta sıfırlanır.
    */
-  roleCheckUnreachable: boolean;
+  roleCheckStatus: RoleCheckStatus;
 }
 
 export interface AuthContextValue extends AuthState {
@@ -160,7 +172,7 @@ const LOADING: AuthState = {
   role: null,
   connectionProblem: false,
   roleConfirmed: false,
-  roleCheckUnreachable: false,
+  roleCheckStatus: 'pending',
 };
 const SIGNED_OUT: AuthState = {
   status: 'signedOut',
@@ -168,7 +180,7 @@ const SIGNED_OUT: AuthState = {
   role: null,
   connectionProblem: false,
   roleConfirmed: false,
-  roleCheckUnreachable: false,
+  roleCheckStatus: 'pending',
 };
 
 /**
@@ -241,7 +253,11 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
   // OSP-71: onayın hangi oturum için alındığı da tutulur (`sessionKey`). Rol seçimi eskisi gibi
   // kullanıcıya göredir; `roleConfirmed` ise yalnızca aynı oturum için true olur.
   const serverRoleRef = useRef<{ userId: string; sessionKey: string | null; role: AppRole } | null>(null);
-  const meInFlightRef = useRef<Promise<void> | null>(null);
+  // OSP-71: uçuştaki /auth/me istekleri, başladıkları oturumun anahtarına göre. Single-flight
+  // OTURUM BAŞINA uygulanır: aynı oturum için asla iki paralel istek olmaz, ama yeni bir oturum
+  // (ör. A çıktı, B girdi) A'nın yavaş isteğini beklemeden kendi isteğini hemen başlatır. Eski
+  // isteğin cevabı R2 kontrolleriyle atılır.
+  const meInFlightRef = useRef<Map<string | null, Promise<void>>>(new Map());
   const lastMeStartRef = useRef<number | null>(null);
   // OSP-71: son kontrolün hangi oturum için başladığı. Throttle yalnızca aynı oturum için
   // uygulanır; yeni bir giriş (farklı oturum) 10 sn kuralına takılmadan hemen doğrulanır.
@@ -250,9 +266,9 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
   // checkMe yeni bir istek başlattığında çağrılır; böylece iki kontrol arası en fazla 15 sn olur
   // ve focus/visibility kontrolünün hemen ardından gereksiz bir periyodik istek gitmez.
   const reschedulePeriodicRef = useRef<(() => void) | null>(null);
-  // OSP-71: son /auth/me'si geçici hatayla biten oturumun anahtarı (`sessionKeyOf`). Token
-  // yenilemesinde (applySession) bilgi bu sayede korunur; başka bir oturuma taşınmaz.
-  const meUnreachableKeyRef = useRef<string | null>(null);
+  // OSP-71: son rol kontrolü durumunun hangi oturuma (`sessionKeyOf`) ait olduğu. Token
+  // yenilemesinde (applySession) durum bu sayede korunur; başka bir oturuma taşınmaz.
+  const roleCheckRef = useRef<{ key: string | null; status: RoleCheckStatus } | null>(null);
   const logoutInFlightRef = useRef<Promise<void> | null>(null);
 
   /** Bir oturumun geçerli rolü: aynı kullanıcı için sunucu rolü biliniyorsa o, yoksa JWT iddiası. */
@@ -265,7 +281,7 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
     sessionRef.current = session;
     if (!session) {
       serverRoleRef.current = null;
-      meUnreachableKeyRef.current = null;
+      roleCheckRef.current = null;
       setState(SIGNED_OUT);
       return;
     }
@@ -280,14 +296,20 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
         confirmKey !== null &&
         server.userId === userIdOf(session) &&
         server.sessionKey === confirmKey);
-    const roleCheckUnreachable = meUnreachableKeyRef.current === sessionKeyOf(session);
+    const check = roleCheckRef.current;
+    const roleCheckStatus: RoleCheckStatus =
+      confirmKey === null
+        ? 'missingSessionId'
+        : check !== null && check.key === sessionKeyOf(session)
+          ? check.status
+          : 'pending';
     setState({
       status: 'signedIn',
       session,
       role: roleOf(session),
       connectionProblem: false,
       roleConfirmed,
-      roleCheckUnreachable,
+      roleCheckStatus,
     });
   }, [roleOf]);
 
@@ -305,9 +327,11 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
   const checkMe = useCallback(async (): Promise<void> => {
     const d = depsRef.current;
     if (d.mode === 'mock') return;
-    if (meInFlightRef.current) return meInFlightRef.current;
-    lastMeStartRef.current = d.now();
     const startedFor = sessionRef.current ? sessionKeyOf(sessionRef.current) : null;
+    // OSP-71: aynı oturum için uçuşta bir istek varsa onu paylaş (oturum başına single-flight).
+    const inFlight = meInFlightRef.current.get(startedFor);
+    if (inFlight) return inFlight;
+    lastMeStartRef.current = d.now();
     // OSP-71: onay anahtarı ayrı tutulur (session_id yoksa null -> onay yok).
     const startedConfirmKey = sessionRef.current ? confirmKeyOf(sessionRef.current) : null;
     lastMeKeyRef.current = startedFor;
@@ -315,19 +339,20 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
     reschedulePeriodicRef.current?.();
 
     /**
-     * OSP-71: "sunucuya ulaşılamıyor" işaretini günceller. Yalnızca soran oturum hâlâ geçerliyse
-     * ve çıkışı beklemede değilse uygulanır (R2): başka bir oturumun geç gelen sonucu yeni oturumu
-     * etkilemez. Hiçbir durumda oturumu kapatmaz.
+     * OSP-71: rol kontrolü durumunu günceller. Yalnızca soran oturum hâlâ geçerliyse ve çıkışı
+     * beklemede değilse uygulanır (R2): başka bir oturumun geç gelen sonucu yeni oturumu
+     * etkilemez. `session_id`'siz oturumda durum her zaman `missingSessionId` kalır. Hiçbir durumda
+     * oturumu kapatmaz.
      */
-    const setUnreachable = (unreachable: boolean) => {
+    const setCheckStatus = (status: RoleCheckStatus) => {
       const current = sessionRef.current;
       if (!current || startedFor === null || sessionKeyOf(current) !== startedFor) return;
       if (isLogoutPending(d.storage(), startedFor)) return;
-      if (unreachable) meUnreachableKeyRef.current = startedFor;
-      else if (meUnreachableKeyRef.current === startedFor) meUnreachableKeyRef.current = null;
+      const next: RoleCheckStatus = confirmKeyOf(current) === null ? 'missingSessionId' : status;
+      roleCheckRef.current = { key: startedFor, status: next };
       setState((prev) =>
-        prev.session && sessionKeyOf(prev.session) === startedFor && prev.roleCheckUnreachable !== unreachable
-          ? { ...prev, roleCheckUnreachable: unreachable }
+        prev.session && sessionKeyOf(prev.session) === startedFor && prev.roleCheckStatus !== next
+          ? { ...prev, roleCheckStatus: next }
           : prev,
       );
     };
@@ -345,27 +370,34 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
         }
         // OSP-71: beklenmeyen istisna da geçici hata gibi ele alınır (sunucuya ulaşıldığı
         // doğrulanamadı); /admin süresiz "Yükleniyor…"da kalmaz. Oturum kapanmaz.
-        setUnreachable(true);
+        setCheckStatus('unreachable');
         return;
       }
       if (!result.ok) {
-        // OSP-71: geçici hata (ağ, TIMEOUT, 5xx, 429) işareti koyar. Geçici olmayan bir sonuç
-        // (HTTP_ERROR, FORBIDDEN, SESSION_CHANGED vb.) sunucunun erişilebilir olduğunu gösterir ve
-        // işareti kaldırır. Kesin red (401/403 -> zorla çıkış) apiClient'ta eskisi gibi ele alınır;
-        // o durumda oturum zaten bittiği için burada bir şey değişmez.
-        setUnreachable(isTransientMeError(result.error.kind));
+        // OSP-71: geçici hata (ağ, TIMEOUT, 5xx, 429) -> `unreachable`. Geçici olmayan bir sonuç
+        // (HTTP_ERROR, FORBIDDEN, SESSION_CHANGED vb.) -> `failed`: sunucuya ulaşıldı ama rol
+        // onaylanamadı. Kesin red (401/403 -> zorla çıkış) apiClient'ta eskisi gibi ele alınır; o
+        // durumda oturum zaten bittiği için setCheckStatus R2 kontrolünde hiçbir şey yapmaz.
+        setCheckStatus(isTransientMeError(result.error.kind) ? 'unreachable' : 'failed');
         return;
       }
-      // OSP-71: 2xx cevap (biçimsiz gövde dahil) sunucunun erişilebilir olduğunu gösterir.
-      setUnreachable(false);
       const body = result.data;
-      if (!body || typeof body.role !== 'string' || typeof body.user_id !== 'string') return;
+      if (!body || typeof body.role !== 'string' || typeof body.user_id !== 'string') {
+        // OSP-71: 2xx ama biçimsiz / boş gövde: sunucuya ulaşıldı, rol onaylanamadı.
+        setCheckStatus('failed');
+        return;
+      }
 
       // R2: apply the answer only to the session that asked, and only for the same user. A stale
       // answer (user A's, arriving while user B is signed in) must not sign B out.
       const session = sessionRef.current;
       if (!session || isLogoutPending(d.storage(), sessionKeyOf(session))) return;
-      if (sessionKeyOf(session) !== startedFor || userIdOf(session) !== body.user_id) return;
+      if (sessionKeyOf(session) !== startedFor) return;
+      if (userIdOf(session) !== body.user_id) {
+        // OSP-71: aynı oturum ama başka bir kullanıcının cevabı: rol bu oturum için onaylanamadı.
+        setCheckStatus('failed');
+        return;
+      }
       // Server role wins over the JWT claim. A non-web role must not use the dashboard.
       if (!isWebRole(body.role)) {
         await d.forceSignOut('ROLE_NOT_ALLOWED', session.access_token);
@@ -373,6 +405,8 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
       }
       const role = body.role;
       serverRoleRef.current = { userId: body.user_id, sessionKey: startedConfirmKey, role };
+      // OSP-71: başarılı cevap: bilinen bir sorun kalmadı.
+      setCheckStatus('pending');
       // OSP-71: cevap bu oturum için alındıysa (ve token'da session_id varsa) rol sunucu onaylıdır.
       setState((prev) =>
         prev.session && userIdOf(prev.session) === body.user_id
@@ -387,10 +421,12 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
       );
     })();
 
-    meInFlightRef.current = run.finally(() => {
-      meInFlightRef.current = null;
+    const tracked = run.finally(() => {
+      // Yalnızca kendi kaydını siler (aynı anahtar için sonradan başlamış bir isteği değil).
+      if (meInFlightRef.current.get(startedFor) === tracked) meInFlightRef.current.delete(startedFor);
     });
-    return meInFlightRef.current;
+    meInFlightRef.current.set(startedFor, tracked);
+    return tracked;
   }, []);
 
   /**
@@ -398,7 +434,7 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
    * kurtarma sonrası, /login'den panele geçiş) ortak koruması. Kontrol yalnızca şu durumda gider:
    * oturum var, sekme görünür, /login'de değiliz (R12: orada giriş sürüyor olabilir) ve bu oturumun
    * çıkışı beklemede değil. `throttle` true ise aynı oturum için son kontrol 10 sn'den yeniyse
-   * atlanır. Aynı anda tek istek kuralı (single-flight) checkMe içinde zaten uygulanır; mock mod da
+   * atlanır. Oturum başına tek istek kuralı (single-flight) checkMe içinde zaten uygulanır; mock mod da
    * checkMe içinde atlanır.
    */
   const guardedCheck = useCallback(
@@ -593,7 +629,7 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
     };
     function tick() {
       timer = undefined;
-      // Önce bir sonraki turu kur: istek uçuştaysa checkMe yeni istek başlatmaz (single-flight)
+      // Önce bir sonraki turu kur: aynı oturumun isteği uçuştaysa checkMe yeni istek başlatmaz (single-flight)
       // ve zamanlayıcıyı da yeniden kurmaz; periyot yine de devam etmeli.
       schedule();
       // Throttle yok: periyodun kendisi zaten son kontrolden 15 sn sonrasıdır.
@@ -616,11 +652,18 @@ export function AuthProvider({ deps, children }: { deps: AuthProviderDeps; child
   // OSP-71: kullanıcı /login'den panele geçtiğinde (yeni giriş tamamlandı ya da kayıtlı oturumla
   // /login'den yönlendirildi) bir kez kontrol et. /login'de kontrol yapılmadığı (R12) için bu
   // geçiş, yeni oturumun sunucuda doğrulandığı ilk andır. Throttle aynı oturum için çift isteği önler.
-  const previousPathRef = useRef(location.pathname);
+  // Sıra fark etmez: /login'de bulunulduğu işaretlenir ve "pathname /login dışı VE oturum açık"
+  // koşulu ilk kez sağlandığında (pathname önce de değişse, status önce de signedIn olsa) kontrol
+  // bir kez tetiklenir ve işaret silinir. Hiç /login'de bulunmamış bir sekmeye gelen SIGNED_IN
+  // (başka sekmedeki giriş) bilerek tetiklemez; onu periyodik kontrol karşılar.
+  const leftLoginPendingRef = useRef(false);
   useEffect(() => {
-    const previous = previousPathRef.current;
-    previousPathRef.current = location.pathname;
-    if (previous === '/login' && location.pathname !== '/login' && state.status === 'signedIn') {
+    if (location.pathname === '/login') {
+      leftLoginPendingRef.current = true;
+      return;
+    }
+    if (leftLoginPendingRef.current && state.status === 'signedIn') {
+      leftLoginPendingRef.current = false;
       guardedCheck(true);
     }
   }, [location.pathname, state.status, guardedCheck]);

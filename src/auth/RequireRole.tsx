@@ -1,9 +1,45 @@
-import { useEffect, type ReactNode } from 'react';
-import { Navigate, useLocation } from 'react-router-dom';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { can, type PermissionAction } from '../lib/permissions';
 import { isWebRole, routeForRole } from '../lib/roles';
 import { ACCESS_DENIED_STATE } from './accessDenied';
-import { useAuth } from './AuthProvider';
+import { useAuth, type RoleCheckStatus } from './AuthProvider';
+
+// OSP-71: rol onayı beklenirken gösterilen metinler (RoleCheckStatus'a göre).
+const WAITING_MESSAGES: Record<Exclude<RoleCheckStatus, 'missingSessionId'>, string> = {
+  pending: 'Yükleniyor…',
+  unreachable: 'Sunucuya ulaşılamıyor. Yeniden deneniyor…',
+  failed: 'Rol doğrulanamadı. Yeniden deneniyor…',
+};
+
+/**
+ * OSP-71: token'da `session_id` yoksa rol hiçbir zaman onaylanamaz. Süresiz bekleme yerine açık
+ * bir hata ve mevcut güvenli çıkış akışını (AuthProvider `logout`, D1/D2) başlatan bir buton
+ * gösterilir. Otomatik çıkış YAPILMAZ; kullanıcı karar verir.
+ */
+function MissingSessionIdNotice() {
+  const { logout } = useAuth();
+  const navigate = useNavigate();
+  const [loggingOut, setLoggingOut] = useState(false);
+  const loggingOutRef = useRef(false);
+
+  async function handleLogout() {
+    if (loggingOutRef.current) return; // çift tıklamayı yok say
+    loggingOutRef.current = true;
+    setLoggingOut(true);
+    await logout();
+    navigate('/login', { replace: true });
+  }
+
+  return (
+    <div role="alert" className="banner-error">
+      <p>Oturum bilgisi eksik. Lütfen çıkış yapıp yeniden giriş yapın.</p>
+      <button type="button" onClick={handleLogout} disabled={loggingOut}>
+        {loggingOut ? 'Çıkış yapılıyor…' : 'Çıkış yap'}
+      </button>
+    </div>
+  );
+}
 
 /**
  * UI-level route guard. It only hides screens. The backend still enforces RBAC
@@ -17,13 +53,14 @@ import { useAuth } from './AuthProvider';
  * - Rol `rescuer` (JWT'den gelse bile) -> oturum ROLE_NOT_ALLOWED ile zorla kapatılır ve /login'e
  *   gidilir; /login bu gerekçeyi gösterir. Çıkış render sırasında değil, efekt içinde başlatılır.
  * - Bilinmeyen / eksik rol -> /login (güvenli taraf).
- * - `requireConfirmedRole` verilmişse rol GET /auth/me ile bu oturum için onaylanana kadar
- *   "Yükleniyor…" gösterilir (ör. /admin: JWT'deki eski bir yönetici iddiası ekranı açmasın).
- *   /auth/me geçici hata verdiyse (ağ, TIMEOUT, 5xx, 429) bunun yerine "Sunucuya ulaşılamıyor.
- *   Yeniden deneniyor…" gösterilir; oturum kapanmaz.
- * - Web rolü ama `action` için yetkisiz (ör. coordinator -> /admin) -> rolün ana sayfasına
- *   (`routeForRole`) gidilir ve orada "Bu sayfaya erişim yetkiniz yok." uyarısı gösterilir. Oturum
- *   açık kalır.
+ * - Mevcut rol (sunucu rolü ya da JWT) `action` için yetkisizse (ör. coordinator -> /admin) onay
+ *   BEKLENMEDEN rolün ana sayfasına (`routeForRole`) gidilir ve orada "Bu sayfaya erişim
+ *   yetkiniz yok." uyarısı gösterilir; oturum açık kalır. Erken reddetmek güvenli yöndür (hiçbir
+ *   şey açmaz); sunucuya ulaşılamasa da coordinator bekleme ekranında takılmaz.
+ * - `requireConfirmedRole` verilmişse ve mevcut rol yetkili görünüyorsa (ör. JWT administrator),
+ *   içerik ancak rol GET /auth/me ile bu oturum için onaylanınca gösterilir. Beklerken
+ *   `roleCheckStatus`'a göre "Yükleniyor…", "Sunucuya ulaşılamıyor…", "Rol doğrulanamadı…" ya da
+ *   (session_id yoksa) çıkış butonlu bir hata gösterilir; oturum kapanmaz.
  *
  * The session is re-checked when the page is restored from the browser's back/forward
  * cache (`pageshow` with `persisted`). Without this, pressing Back after logout could
@@ -39,7 +76,7 @@ export function RequireRole({
   requireConfirmedRole?: boolean;
   children: ReactNode;
 }) {
-  const { status, role, roleConfirmed, roleCheckUnreachable, revalidate, connectionProblem, signOutDisallowedRole } =
+  const { status, role, roleConfirmed, roleCheckStatus, revalidate, connectionProblem, signOutDisallowedRole } =
     useAuth();
   const location = useLocation();
   const disallowedRole = status === 'signedIn' && role === 'rescuer';
@@ -71,21 +108,19 @@ export function RequireRole({
   if (status === 'signedOut') return <Navigate to="/login" replace />;
   // Rescuer ve bilinmeyen roller: panel hiç gösterilmeden /login (rescuer için çıkış efektte).
   if (!isWebRole(role)) return <Navigate to="/login" replace />;
-  if (requireConfirmedRole && !roleConfirmed) {
-    // OSP-71: son /auth/me geçici hatayla bittiyse süresiz "Yükleniyor…" yerine bağlantı sorunu
-    // gösterilir (oturum açık kalır; periyodik / focus kontrolü yeniden dener). Bekleme metinleri
-    // ekran okuyucuya duyurulsun diye role="status".
-    return roleCheckUnreachable ? (
-      <p role="status">Sunucuya ulaşılamıyor. Yeniden deneniyor…</p>
-    ) : (
-      <p role="status">Yükleniyor…</p>
-    );
-  }
+  // OSP-71: yetkisizlik onaydan ÖNCE kontrol edilir (erken red güvenli yöndür).
   if (!can(role, action)) {
     const home = routeForRole(role);
     // Döngü koruması: rolün ana sayfası da bu korumaya takılıyorsa (matris hatası) /login'e git.
     if (home === location.pathname) return <Navigate to="/login" replace />;
     return <Navigate to={home} replace state={ACCESS_DENIED_STATE} />;
+  }
+  // İzin ise yalnızca sunucu onayından sonra verilir.
+  if (requireConfirmedRole && !roleConfirmed) {
+    if (roleCheckStatus === 'missingSessionId') return <MissingSessionIdNotice />;
+    // Bekleme metinleri ekran okuyucuya duyurulsun diye role="status"; periyodik / focus
+    // kontrolü yeniden dener, oturum açık kalır.
+    return <p role="status">{WAITING_MESSAGES[roleCheckStatus]}</p>;
   }
   return <>{children}</>;
 }

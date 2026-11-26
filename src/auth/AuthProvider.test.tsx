@@ -869,6 +869,51 @@ describe('AuthProvider: check after recovery / moving on to the panel (OSP-71)',
     expect(deps.fetchMe).toHaveBeenCalledTimes(1);
   });
 
+  // PR #5 düzeltme 4: giriş sonrası kontrol, pathname ile status'un hangi sırayla değiştiğinden
+  // bağımsız olarak bir kez çalışır.
+  it('checks once when the path leaves /login BEFORE the session is known', async () => {
+    const { deps, emit } = makeAuthDeps({ now: () => Date.now() });
+    deps.getSession.mockReturnValue(new Promise(() => undefined)); // açılış okuması bitmez
+    renderWithRoutes(deps, '/login');
+    await flush();
+    expect(probe()).toBe('loading|-|/login');
+
+    // Önce pathname değişir (oturum henüz bilinmiyor), sonra status signedIn olur.
+    fireEvent.click(screen.getByRole('button', { name: 'GO PANEL' }));
+    await flush();
+    expect(probe()).toBe('loading|-|/dashboard');
+    expect(deps.fetchMe).not.toHaveBeenCalled();
+
+    act(() => emit('SIGNED_IN', sessionFor('coordinator')));
+    await flush();
+    expect(screen.getByText('PANEL CONTENT')).toBeInTheDocument();
+    expect(deps.fetchMe).toHaveBeenCalledTimes(1);
+
+    // Sonraki durum değişiklikleri (token yenilemesi) ikinci bir giriş sonrası kontrolü açmaz.
+    act(() => emit('TOKEN_REFRESHED', sessionFor('coordinator', 'user-1', 'r2')));
+    await flush();
+    expect(deps.fetchMe).toHaveBeenCalledTimes(1);
+  });
+
+  it('checks once when the session is known BEFORE the path leaves /login', async () => {
+    const { deps, emit } = makeAuthDeps({ now: () => Date.now() });
+    renderWithRoutes(deps, '/login');
+    await flush();
+
+    act(() => emit('SIGNED_IN', sessionFor('coordinator')));
+    await flush();
+    expect(deps.fetchMe).not.toHaveBeenCalled(); // R12: /login'de kontrol yok
+
+    fireEvent.click(screen.getByRole('button', { name: 'GO PANEL' }));
+    await flush();
+    expect(screen.getByText('PANEL CONTENT')).toBeInTheDocument();
+    expect(deps.fetchMe).toHaveBeenCalledTimes(1);
+
+    act(() => emit('TOKEN_REFRESHED', sessionFor('coordinator', 'user-1', 'r2')));
+    await flush();
+    expect(deps.fetchMe).toHaveBeenCalledTimes(1);
+  });
+
   it('a different session signed in within 10 s is checked at once; the same session is throttled', async () => {
     const { deps, emit } = makeAuthDeps({ now: () => Date.now() });
     deps.getSession.mockResolvedValue(sessionFor('coordinator', 'user-a'));

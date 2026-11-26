@@ -18,7 +18,7 @@ function withAuth(children: ReactNode, role: AppRole = 'administrator') {
           role,
           connectionProblem: false,
           roleConfirmed: true,
-          roleCheckUnreachable: false,
+          roleCheckStatus: 'pending',
           logout: vi.fn().mockResolvedValue(undefined),
           revalidate: vi.fn().mockResolvedValue(undefined),
           signOutDisallowedRole: vi.fn().mockResolvedValue(undefined),

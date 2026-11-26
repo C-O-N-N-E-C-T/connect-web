@@ -12,7 +12,7 @@ function renderGate(role: AppRole | null, action: PermissionAction, fallback?: s
     role,
     connectionProblem: false,
     roleConfirmed: role !== null,
-    roleCheckUnreachable: false,
+    roleCheckStatus: 'pending',
     logout: vi.fn().mockResolvedValue(undefined),
     revalidate: vi.fn().mockResolvedValue(undefined),
     signOutDisallowedRole: vi.fn().mockResolvedValue(undefined),
